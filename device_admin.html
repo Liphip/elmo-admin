@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Device Admin</title>
+    <link rel="stylesheet" href="styles.css">
+    <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
+    <script>
+        class DeviceAdmin {
+            constructor() {
+                this.apiUrl = '';
+                this.apiKey = '';
+                this.loadConfig();
+                this.bindEvents();
+            }
+
+            loadConfig() {
+                const config = JSON.parse(localStorage.getItem('deviceAdminConfig'));
+                if (config) {
+                    this.apiUrl = config.apiUrl;
+                    this.apiKey = config.apiKey;
+                    $('#api-url').val(this.apiUrl);
+                    $('#api-key').val(this.apiKey);
+                }
+            }
+
+            saveConfig() {
+                this.apiUrl = $('#api-url').val();
+                this.apiKey = $('#api-key').val();
+                const config = {
+                    apiUrl: this.apiUrl,
+                    apiKey: this.apiKey
+                };
+                localStorage.setItem('deviceAdminConfig', JSON.stringify(config));
+            }
+
+            bindEvents() {
+                $('#config-form').on('submit', (event) => {
+                    event.preventDefault();
+                    this.saveConfig();
+                });
+            }
+        }
+    </script>
+</head>
+<body>
+    <header>
+        <h1>Device Administration</h1>
+    </header>
+    <nav>
+        <ul>
+            <li><a href="#config">Configuration</a></li>
+            <li><a href="#home">Home</a></li>
+            <li><a href="#devices">Devices</a></li>
+            <li><a href="#settings">Settings</a></li>
+        </ul>
+    </nav>
+    <main>
+        <section id="config">
+            <h2>Configuration</h2>
+            <p>Configure your API connection to Element IoT here.</p>
+            <form id="config-form">
+                <label for="api-url">API URL:</label>
+                <input type="text" id="api-url" name="api-url">
+                <label for="api-key">API Key:</label>
+                <input type="text" id="api-key" name="api-key">
+                <button type="submit" id="save-config">Save Configuration</button>
+            </form>
+        </section>
+        <section id="home">
+            <h2>Welcome</h2>
+            <p>Welcome to the Device Administration web application.</p>
+        </section>
+        <section id="devices">
+            <h2>Devices</h2>
+            <p>Manage your devices here.</p>
+        </section>
+        <section id="settings">
+            <h2>Settings</h2>
+            <p>Configure your settings here.</p>
+        </section>
+    </main>
+    <footer>
+        <p>&copy; 2023 Device Admin</p>
+    </footer>
+    <script>
+        const deviceAdmin = new DeviceAdmin();
+    </script>
+</body>
+</html></section>
