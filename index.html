@@ -1,0 +1,831 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Elmo — Element IoT Bulk Manager</title>
+  <link rel="stylesheet" href="vendor/bootstrap.min.css">
+  <link rel="stylesheet" href="vendor/bootstrap-icons.min.css">
+  <link rel="stylesheet" href="css/styles.css">
+</head>
+<body>
+  <div id="loading-bar"></div>
+  <div id="loading-text"></div>
+  <div id="toast-container" aria-live="polite" aria-atomic="true"></div>
+
+  <div id="app-wrapper" class="d-flex">
+
+    <!-- Sidebar -->
+    <nav id="sidebar" class="d-flex flex-column p-2 gap-1">
+      <div class="sidebar-brand d-flex align-items-center gap-2 px-2 py-3 mb-1">
+        <i class="bi bi-router fs-5 sidebar-icon"></i>
+        <span class="lbl">Elmo</span>
+      </div>
+      <a href="#" class="nav-link active" data-view="home"><i class="bi bi-house-fill sidebar-nav-icon"></i> <span class="lbl">Home</span></a>
+      <a href="#" class="nav-link" data-view="devices"><i class="bi bi-cpu-fill sidebar-nav-icon"></i> <span class="lbl">Devices</span></a>
+      <a href="#" class="nav-link" data-view="folders"><i class="bi bi-folder-fill sidebar-nav-icon"></i> <span class="lbl">Folders</span></a>
+      <a href="#" class="nav-link" data-view="mandates"><i class="bi bi-building sidebar-nav-icon"></i> <span class="lbl">Mandates</span></a>
+      <a href="#" class="nav-link" data-view="actions"><i class="bi bi-lightning-fill sidebar-nav-icon"></i> <span class="lbl">Actions</span></a>
+      
+      <div class="mt-auto px-2 pb-1 d-flex align-items-center gap-2">
+        <span id="conn-dot"></span>
+        <span class="lbl conn-label" id="conn-label">Not connected</span>
+      </div>
+
+      <!-- API Log -->
+      <a href="#" class="nav-link" data-view="api-log"><i class="bi bi-clock-history sidebar-nav-icon"></i> <span class="lbl">API Log</span></a>
+
+      <!-- Configuration -->
+      <a href="#" class="nav-link" data-view="config"><i class="bi bi-gear-fill sidebar-nav-icon"></i> <span class="lbl">Configuration</span></a>
+
+      <!-- Legal -->
+      <a href="LEGAL.html" class="nav-link"><i class="bi bi-file-earmark-text sidebar-nav-icon"></i> <span class="lbl">Legal</span></a>
+
+      <div class="sidebar-footer lbl px-2 pb-1">
+        <span class="sidebar-footer-copy">&copy; 2025 Philip Laskowicz &mdash; MIT</span>
+      </div>
+
+      <button type="button" class="btn btn-sm sidebar-toggle-btn mt-2" id="sidebar-toggle" title="Toggle sidebar" aria-label="Toggle sidebar">
+        <i class="bi bi-layout-sidebar-reverse"></i>
+      </button>
+    </nav>
+
+    <!-- Main content -->
+    <main id="main-content" class="flex-grow-1 p-4">
+
+      <!-- HOME -->
+      <section id="view-home" class="view-section active">
+        <div class="mb-4">
+          <h4><i class="bi bi-house-fill me-2"></i>Welcome to Elmo</h4>
+        </div>
+
+        <div class="alert alert-warning mb-4">
+          <h5 class="alert-heading"><i class="bi bi-exclamation-triangle me-2"></i>Important Disclaimer</h5>
+          <p class="mb-0">
+            This tool is provided "as is" without any warranty. Incorrect use or undetected errors may lead to unintended changes to your devices, folders, or configurations. Always review actions before executing them and maintain backups of your data. The developer assumes no liability for any data loss or damage resulting from the use of this application.
+          </p>
+        </div>
+
+        <div class="alert alert-info mb-4">
+          <h5 class="alert-heading"><i class="bi bi-info-circle me-2"></i>Independent Third-Party Tool</h5>
+          <p class="mb-0">
+            Elmo is an <strong>unofficial third-party tool</strong> and is <strong>not affiliated with, endorsed by, or connected to Zenner IoT Solutions GmbH</strong> or the <strong>Element IoT</strong> product. This application was developed independently and is not part of the official Element IoT platform.
+          </p>
+        </div>
+
+        <div class="alert alert-info mb-4">
+          <h5><i class="bi bi-shield-lock me-2"></i>Data Storage & Transmission</h5>
+          <ul class="mb-0">
+            <li><strong>No data is transmitted to the developer.</strong> All API requests go directly from your browser to the Element IoT API.</li>
+            <li>API credentials are stored only in your browser's localStorage (if you enable "Remember credentials").</li>
+            <li>No analytics, tracking, or cookies are used.</li>
+            <li>Device data is loaded into memory only and is cleared when you close the browser tab.</li>
+          </ul>
+        </div>
+
+        <div class="card mb-4">
+          <div class="card-header">
+            <h5 class="mb-0"><i class="bi bi-question-circle me-2"></i>How It Works</h5>
+          </div>
+          <div class="card-body">
+            <p>Elmo is a client-side web application that connects directly to the Element IoT API. It allows you to:</p>
+            <div class="row g-3">
+              <div class="col-md-6">
+                <h6><i class="bi bi-cpu me-1"></i>Devices</h6>
+                <ul class="small">
+                  <li>View, search, and filter all devices</li>
+                  <li>Edit device names</li>
+                  <li>Add/remove devices from folders</li>
+                  <li>Send actions to devices</li>
+                  <li>Bulk operations on multiple devices</li>
+                </ul>
+              </div>
+              <div class="col-md-6">
+                <h6><i class="bi bi-folder me-1"></i>Folders & Mandates</h6>
+                <ul class="small">
+                  <li>Create and manage folders (tags)</li>
+                  <li>View mandates and their devices</li>
+                  <li>Organize devices into folders</li>
+                </ul>
+              </div>
+              <div class="col-md-6">
+                <h6><i class="bi bi-lightning me-1"></i>Actions</h6>
+                <ul class="small">
+                  <li>View recent action history</li>
+                  <li>Create and schedule new actions</li>
+                  <li>Cancel pending actions</li>
+                </ul>
+              </div>
+              <div class="col-md-6">
+                <h6><i class="bi bi-clock-history me-1"></i>API Log</h6>
+                <ul class="small">
+                  <li>Monitor all API requests</li>
+                  <li>Debug connectivity issues</li>
+                  <li>Export logs for support</li>
+                </ul>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-header">
+            <h5 class="mb-0"><i class="bi bi-gear me-2"></i>Configuration</h5>
+          </div>
+          <div class="card-body">
+            <h6>Prerequisites</h6>
+            <ol>
+              <li><strong>Create an API Key in Element IoT:</strong>
+                <ul>
+                  <li>Log into your Element IoT dashboard</li>
+                  <li><strong>Option A (Mandate-specific key):</strong> Go to <em>Settings → API keys → Add new API key</em></li>
+                  <li><strong>Option B (Superadmin):</strong> Go to <em>Administration → Accounts, Users & API key → Create</em></li>
+                  <li>Create a new API key with the desired permissions (read/write depending on your needs)</li>
+                </ul>
+              </li>
+              <li><strong>Add Allowed Origin:</strong>
+                <ul>
+                  <li>In the same API settings, add this application's URL as an allowed origin:</li>
+                  <li><code id="app-url">loading...</code></li>
+                </ul>
+              </li>
+            </ol>
+            <h6>Setup</h6>
+            <ol>
+              <li>Go to the <strong>Configuration</strong> tab in the sidebar</li>
+              <li>Enter your Element IoT domain (e.g., <code>https://your-instance.element-iot.com</code>)</li>
+              <li>Enter your API Key</li>
+              <li>Click <strong>Save</strong> or <strong>Test Connection</strong></li>
+            </ol>
+            <div class="alert alert-secondary small mb-0">
+              <i class="bi bi-info-circle me-1"></i>
+              <strong>Note:</strong> If you see a CORS error, make sure your Element IoT instance allows requests from this application's URL.
+            </div>
+          </div>
+        </div>
+
+        <div class="card mb-4">
+          <div class="card-header">
+            <h5 class="mb-0"><i class="bi bi-github me-2"></i>GitHub & Support</h5>
+          </div>
+          <div class="card-body">
+            <p>
+              Elmo is open source. You can find the source code and report issues on GitHub:
+            </p>
+            <div class="d-flex gap-2 flex-wrap mb-3">
+              <a href="https://github.com/liphip/elmo-admin" class="btn btn-outline-secondary" target="_blank">
+                <i class="bi bi-github me-1"></i>View on GitHub
+              </a>
+              <a href="https://github.com/liphip/elmo-admin/issues/new/choose" class="btn btn-outline-primary" target="_blank">
+                <i class="bi bi-bug me-1"></i>Report an Issue
+              </a>
+            </div>
+            <p class="small text-muted mb-0">
+              When reporting issues, please include details about what you were doing, any error messages, and your browser/environment information.
+            </p>
+          </div>
+        </div>
+      </section>
+
+      <!-- CONFIG -->
+      <section id="view-config" class="view-section">
+        <h4 class="mb-4"><i class="bi bi-gear-fill me-2"></i>Configuration</h4>
+        <div id="cors-hint" class="alert alert-info cfg-card mb-3 d-none">
+          <strong><i class="bi bi-info-circle me-1"></i>CORS restriction detected</strong> — browsers block
+          cross-origin requests when opening an HTML file directly (<code>file://</code>).<br>
+          <strong>Fix:</strong> serve this file from a local HTTP server so the browser has a real origin:
+          <ul class="mb-1 mt-1">
+            <li>VS Code: click <em>Go Live</em> (Live Server extension) → opens at <code>http://localhost:5500</code></li>
+            <li>Python: <code>python -m http.server 8080</code> → open <code>http://localhost:8080/index.html</code></li>
+            <li>Node: <code>npx serve .</code> → follow the printed URL</li>
+          </ul>
+          Then ask your Element IoT admin to add <code>http://localhost:&lt;port&gt;</code> to the server's allowed CORS origins.
+        </div>
+        <div class="card cfg-card">
+          <div class="card-body">
+            <div class="mb-3">
+              <label class="form-label">Element IoT Domain</label>
+              <input type="text" class="form-control" id="cfg-domain" placeholder="https://your-element-instance.com">
+              <div class="form-text">Include http(s)://, no trailing slash.</div>
+            </div>
+            <div class="mb-3">
+              <label class="form-label">API Key</label>
+              <div class="input-group">
+                <input type="password" class="form-control" id="cfg-apikey" placeholder="Your API key" autocomplete="off">
+                <button class="btn btn-outline-secondary" id="cfg-toggle-key" type="button"><i class="bi bi-eye"></i></button>
+              </div>
+            </div>
+            <div class="mb-4 form-check">
+              <input type="checkbox" class="form-check-input" id="cfg-remember" checked>
+              <label class="form-check-label" for="cfg-remember">Remember credentials (localStorage)</label>
+            </div>
+            <div class="mb-4">
+              <label class="form-label">Settings</label>
+              <div class="card">
+                <div class="card-body py-2">
+                  <div class="row g-2 align-items-end">
+                    <div class="col-auto">
+                      <label class="form-label small mb-1">Max API log entries</label>
+                      <input type="number" class="form-control form-control-sm" id="cfg-max-log-entries" value="500" min="10" max="10000" style="width: 100px;">
+                    </div>
+                    <div class="col-auto">
+                      <label class="form-label small mb-1">Max devices in memory</label>
+                      <input type="number" class="form-control form-control-sm" id="cfg-max-devices" value="500" min="100" max="5000" style="width: 100px;">
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+            <div class="d-flex gap-2 flex-wrap">
+              <button type="button" class="btn btn-primary" id="cfg-save"><i class="bi bi-floppy me-1"></i>Save</button>
+              <button type="button" class="btn btn-outline-secondary" id="cfg-test"><i class="bi bi-plug me-1"></i>Test Connection</button>
+              <button type="button" class="btn btn-outline-danger" id="cfg-clear">Clear</button>
+            </div>
+            <div id="cfg-status" class="mt-3"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- DEVICES -->
+      <section id="view-devices" class="view-section">
+        <div class="d-flex align-items-center gap-3 mb-3">
+          <h4 class="mb-0"><i class="bi bi-cpu-fill me-2"></i>Devices</h4>
+          <span class="badge bg-secondary" id="device-count">0</span>
+          <button type="button" class="btn btn-sm btn-outline-secondary" id="dev-stats" title="View Statistics"><i class="bi bi-bar-chart"></i></button>
+          <div class="ms-auto d-flex gap-2">
+            <button type="button" class="btn btn-sm btn-outline-secondary" id="dev-refresh"><i class="bi bi-arrow-clockwise me-1"></i>Refresh</button>
+            <button type="button" class="btn btn-sm btn-primary" id="dev-load-all"><i class="bi bi-cloud-download me-1"></i>Load All</button>
+          </div>
+        </div>
+        <div class="card mb-3">
+          <div class="card-body py-2">
+            <div class="row g-2 align-items-end">
+              <div class="col-md-4">
+                <label class="form-label small mb-1">Search</label>
+                <div class="input-group input-group-sm">
+                  <input type="text" class="form-control" id="dev-filter-name" placeholder="name or slug…">
+                  <button type="button" class="btn btn-outline-secondary dev-filter-regex" id="dev-filter-regex" title="Use regex search">.*</button>
+                </div>
+              </div>
+              <div class="col-md-2">
+                <label class="form-label small mb-1">Type</label>
+                <select class="form-select form-select-sm" id="dev-filter-type" aria-label="Filter by device type">
+                  <option value="">All types</option>
+                  <option value="generic">Generic</option>
+                  <option value="sensor">Sensor</option>
+                  <option value="gateway">Gateway</option>
+                  <option value="virtual">Virtual</option>
+                </select>
+              </div>
+              <div class="col-md-3">
+                <label class="form-label small mb-1">Folder</label>
+                <select class="form-select form-select-sm" id="dev-filter-folder" aria-label="Filter by folder">
+                  <option value="">All folders</option>
+                </select>
+              </div>
+              <div class="col-md-2 d-none" id="dev-filter-mandate-wrap">
+                <label class="form-label small mb-1">Mandate</label>
+                <select class="form-select form-select-sm" id="dev-filter-mandate" aria-label="Filter by mandate">
+                  <option value="">All mandates</option>
+                </select>
+              </div>
+              <div class="col-md-1 d-flex gap-2 align-items-end">
+                <button type="button" class="btn btn-sm btn-outline-secondary" id="dev-filter-apply">Apply</button>
+              </div>
+              <div class="col-md-12"><small class="text-muted" id="dev-filter-count"></small></div>
+            </div>
+            <div class="row g-2 mt-1">
+              <div class="col-md-12">
+                <button type="button" class="btn btn-sm btn-link text-secondary p-0" id="dev-filter-reset">Clear Filters</button>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div id="bulk-action-bar" class="d-none mb-3 rounded">
+          <div class="d-flex flex-wrap align-items-center gap-2">
+            <strong id="bulk-selected-count">0 selected</strong>
+            <div class="vr"></div>
+            <select class="form-select form-select-sm bulk-folder-sel" id="bulk-add-folder-sel" aria-label="Folder to add"><option value="">Select folder…</option></select>
+            <button type="button" class="btn btn-sm btn-outline-primary" id="bulk-add-folder"><i class="bi bi-folder-plus me-1"></i>Add Folder</button>
+            <div class="vr"></div>
+            <select class="form-select form-select-sm bulk-folder-sel" id="bulk-rem-folder-sel" aria-label="Folder to remove"><option value="">Select folder…</option></select>
+            <button type="button" class="btn btn-sm btn-outline-warning" id="bulk-rem-folder"><i class="bi bi-folder-minus me-1"></i>Remove Folder</button>
+            <div class="vr"></div>
+            <button type="button" class="btn btn-sm btn-outline-info" id="bulk-send-action"><i class="bi bi-lightning me-1"></i>Send Action</button>
+            <button type="button" class="btn btn-sm btn-outline-secondary" id="bulk-edit-profile"><i class="bi bi-person-badge me-1"></i>Edit Profile</button>
+            <button type="button" class="btn btn-sm btn-outline-danger" id="bulk-delete"><i class="bi bi-trash me-1"></i>Delete</button>
+            <button type="button" class="btn btn-sm btn-link text-secondary ms-auto p-0" id="bulk-clear">Clear selection</button>
+          </div>
+        </div>
+        <div id="dev-not-loaded" class="text-center py-5 text-muted">
+          <i class="bi bi-cloud-download fs-1 d-block mb-3 opacity-25"></i>
+          <p>Click <strong>Load All</strong> to fetch devices from the API.</p>
+          <p class="small">Ensure API credentials are configured first.</p>
+        </div>
+        <div id="dev-table-wrap" class="card d-none">
+          <div class="card-header py-2">
+            <div class="d-flex justify-content-between align-items-center">
+              <div>
+                <span id="dev-page-info" class="text-muted small">Page 1 of 1 (0 devices)</span>
+              </div>
+              <div class="d-flex gap-2 align-items-center">
+                <select id="dev-page-size" class="form-select form-select-sm" style="width:80px">
+                  <option value="50" selected>50</option>
+                  <option value="100">100</option>
+                  <option value="250">250</option>
+                </select>
+                <button type="button" class="btn btn-sm btn-outline-secondary" id="dev-page-prev" title="Previous page"><i class="bi bi-chevron-left"></i></button>
+                <button type="button" class="btn btn-sm btn-outline-secondary" id="dev-page-next" title="Next page"><i class="bi bi-chevron-right"></i></button>
+              </div>
+            </div>
+          </div>
+          <div class="table-scroll-wrap">
+            <table class="table table-hover table-sm mb-0" id="devices-table">
+              <thead>
+                <tr>
+                  <th class="th-checkbox"><label class="visually-hidden" for="dev-sel-all">Select all</label><input type="checkbox" class="form-check-input" id="dev-sel-all"></th>
+                  <th class="sortable" data-col="name">Name <i class="bi bi-arrow-down-up text-muted small"></i></th>
+                  <th class="sortable d-none d-md-table-cell" data-col="slug">Slug</th>
+                  <th class="sortable" data-col="type">Type</th>
+                  <th>Folders</th>
+                  <th class="sortable d-none d-lg-table-cell" data-col="inserted_at">Created</th>
+                  <th>Mandate</th>
+                  <th class="th-actions"><span class="visually-hidden">Actions</span></th>
+                </tr>
+              </thead>
+              <tbody id="devices-tbody"></tbody>
+            </table>
+          </div>
+          <div class="card-footer py-2 d-flex justify-content-between align-items-center">
+            <div>
+              <button type="button" class="btn btn-sm btn-outline-primary d-none" id="dev-load-more">Load More</button>
+            </div>
+            <div>
+              <button type="button" class="btn btn-sm btn-outline-danger d-none" id="dev-clear">Clear All</button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- FOLDERS -->
+      <section id="view-folders" class="view-section">
+        <div class="d-flex align-items-center gap-3 mb-3">
+          <h4 class="mb-0"><i class="bi bi-folder-fill me-2"></i>Folders</h4>
+          <span class="badge bg-secondary" id="folder-count">0</span>
+          <button type="button" class="btn btn-sm btn-outline-secondary" id="folder-stats" title="View Statistics"><i class="bi bi-bar-chart"></i></button>
+          <div class="ms-auto d-flex gap-2">
+            <button type="button" class="btn btn-sm btn-outline-secondary" id="folder-refresh"><i class="bi bi-arrow-clockwise me-1"></i>Refresh</button>
+            <button type="button" class="btn btn-sm btn-primary" id="folder-new"><i class="bi bi-plus me-1"></i>New Folder</button>
+          </div>
+        </div>
+        <div class="card mb-3">
+          <div class="card-body py-2">
+            <div class="row g-2 align-items-end">
+              <div class="col-md-4">
+                <label class="form-label small mb-1">Search</label>
+                <div class="input-group input-group-sm">
+                  <input type="text" class="form-control" id="tag-filter-name" placeholder="name or slug…">
+                  <button type="button" class="btn btn-outline-secondary tag-filter-regex" id="tag-filter-regex" title="Use regex search">.*</button>
+                </div>
+              </div>
+              <div class="col-md-3 d-none" id="tag-filter-mandate-wrap">
+                <label class="form-label small mb-1">Mandate</label>
+                <select class="form-select form-select-sm" id="tag-filter-mandate" aria-label="Filter folders by mandate">
+                  <option value="">All mandates</option>
+                </select>
+              </div>
+              <div class="col-md-2 d-flex gap-2 align-items-end">
+                <button type="button" class="btn btn-sm btn-outline-secondary" id="tag-filter-apply">Apply</button>
+              </div>
+              <div class="col-md-12"><small class="text-muted" id="tag-filter-count"></small></div>
+            </div>
+            <div class="row g-2 mt-1">
+              <div class="col-md-12">
+                <button type="button" class="btn btn-sm btn-link text-secondary p-0" id="tag-filter-reset">Clear Filters</button>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div id="folders-not-loaded" class="text-center py-5 text-muted">
+          <i class="bi bi-folder fs-1 d-block mb-3 opacity-25"></i>
+          <p>Click <strong>Refresh</strong> to load folders from the API.</p>
+        </div>
+        <div id="folders-loading" class="text-center py-5 text-muted d-none">
+          <div class="spinner-border text-primary mb-3" role="status"></div>
+          <p>Loading folders...</p>
+        </div>
+        <div id="folders-table-wrap" class="card d-none">
+          <table class="table table-hover table-sm mb-0">
+            <thead><tr><th>Name</th><th>Color</th><th>Slug</th><th>Created</th><th>Mandate</th><th></th></tr></thead>
+            <tbody id="folders-tbody"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- MANDATES -->
+      <section id="view-mandates" class="view-section">
+        <div class="d-flex align-items-center gap-3 mb-3">
+          <h4 class="mb-0"><i class="bi bi-building me-2"></i>Mandates</h4>
+          <span class="badge bg-secondary" id="mandate-count">0</span>
+          <button type="button" class="btn btn-sm btn-outline-secondary" id="mandates-stats" title="View Statistics"><i class="bi bi-bar-chart"></i></button>
+          <div class="ms-auto d-flex gap-2">
+            <button type="button" class="btn btn-sm btn-primary" id="mandates-load"><i class="bi bi-cloud-download me-1"></i>Load</button>
+          </div>
+        </div>
+        <div id="mandates-not-loaded" class="text-center py-5 text-muted">
+          <i class="bi bi-building fs-1 d-block mb-3 opacity-25"></i>
+          <p>Click <strong>Load</strong> to fetch mandates from the API.</p>
+        </div>
+        <div id="mandates-loading" class="text-center py-5 text-muted d-none">
+          <div class="spinner-border text-primary mb-3" role="status"></div>
+          <p>Loading mandates...</p>
+        </div>
+        <div id="mandates-container" class="row g-3 d-none"></div>
+      </section>
+
+      <!-- ACTIONS -->
+      <section id="view-actions" class="view-section">
+        <h4 class="mb-3"><i class="bi bi-lightning-fill me-2"></i>Actions</h4>
+        <ul class="nav nav-tabs mb-3" id="actions-nav">
+          <li class="nav-item"><a class="nav-link active" data-atab="recent" href="#">Recent</a></li>
+          <li class="nav-item"><a class="nav-link" data-atab="schedules" href="#">Schedules</a></li>
+          <li class="nav-item"><a class="nav-link" data-atab="create" href="#" id="act-tab-create">New Action</a></li>
+        </ul>
+        <div id="actions-recent-pane">
+          <div class="d-flex gap-2 mb-3 align-items-center">
+            <select class="form-select form-select-sm actions-state-sel" id="actions-state-filter" aria-label="Filter by action state">
+              <option value="">All states</option>
+              <option value="pending">Pending</option>
+              <option value="executing">Executing</option>
+              <option value="executed">Executed</option>
+              <option value="errored">Errored</option>
+              <option value="cancelled">Cancelled</option>
+            </select>
+            <button type="button" class="btn btn-sm btn-primary" id="actions-load"><i class="bi bi-cloud-download me-1"></i>Load</button>
+          </div>
+          <div id="actions-not-loaded" class="text-center py-4 text-muted">
+            <i class="bi bi-clock-history fs-1 d-block mb-3 opacity-25"></i>
+            <p>Click <strong>Load</strong> to fetch actions from the API.</p>
+          </div>
+          <div id="actions-loading" class="text-center py-4 text-muted d-none">
+            <div class="spinner-border text-primary mb-3" role="status"></div>
+            <p>Loading actions...</p>
+          </div>
+          <div id="act-bulk-bar" class="d-none mb-3 rounded">
+            <div class="d-flex flex-wrap align-items-center gap-2">
+              <strong id="act-selected-count">0 selected</strong>
+              <button type="button" class="btn btn-sm btn-outline-danger" id="actions-cancel-selected">Cancel Selected</button>
+              <button type="button" class="btn btn-sm btn-link text-secondary ms-auto p-0" id="actions-clear-selection">Clear selection</button>
+            </div>
+          </div>
+          <div id="actions-table-wrap" class="card d-none">
+            <table class="table table-hover table-sm mb-0">
+              <thead><tr><th class="th-checkbox"><input type="checkbox" class="form-check-input" id="actions-sel-all" aria-label="Select all cancellable actions"></th><th>State</th><th>Type</th><th>Device</th><th>Created</th><th></th></tr></thead>
+              <tbody id="actions-tbody"></tbody>
+            </table>
+          </div>
+          <button type="button" class="btn btn-sm btn-outline-secondary mt-2 d-none" id="actions-more-btn">Load more</button>
+        </div>
+        <div id="actions-schedules-pane" class="d-none">
+          <div class="mb-3 d-flex gap-2 align-items-center">
+            <button type="button" class="btn btn-sm btn-primary" id="schedules-load"><i class="bi bi-cloud-download me-1"></i>Load Schedules</button>
+          </div>
+          <div id="schedules-not-loaded" class="text-center py-4 text-muted">
+            <i class="bi bi-calendar-event fs-1 d-block mb-3 opacity-25"></i>
+            <p>Click <strong>Load Schedules</strong> to fetch schedules from the API.</p>
+          </div>
+          <div id="schedules-loading" class="text-center py-4 text-muted d-none">
+            <div class="spinner-border text-primary mb-3" role="status"></div>
+            <p>Loading schedules...</p>
+          </div>
+          <div id="sched-bulk-bar" class="d-none mb-3 rounded">
+            <div class="d-flex flex-wrap align-items-center gap-2">
+              <strong id="sched-selected-count">0 selected</strong>
+              <button type="button" class="btn btn-sm btn-outline-danger" id="schedules-delete-selected">Delete Selected</button>
+              <button type="button" class="btn btn-sm btn-link text-secondary ms-auto p-0" id="schedules-clear-selection">Clear selection</button>
+            </div>
+          </div>
+          <div id="schedules-table-wrap" class="card d-none">
+            <table class="table table-hover table-sm mb-0">
+              <thead><tr><th class="th-checkbox"><input type="checkbox" class="form-check-input" id="sched-sel-all" aria-label="Select all schedules"></th><th>Type</th><th>Device</th><th>Schedule / Execute At</th><th>Opts</th><th></th></tr></thead>
+              <tbody id="schedules-tbody"></tbody>
+            </table>
+          </div>
+        </div>
+        <div id="actions-create-pane" class="d-none">
+          <div class="card">
+            <div class="card-body">
+              <div class="row g-3">
+                <div class="col-lg-5">
+                  <label class="form-label">Devices</label>
+                  <input type="text" class="form-control form-control-sm mb-2" id="act-dev-search" placeholder="Filter devices…">
+                  <div class="d-flex gap-2 mb-2">
+                    <button type="button" class="btn btn-sm btn-outline-secondary" id="act-dev-all">Select all</button>
+                    <button type="button" class="btn btn-sm btn-outline-secondary" id="act-dev-clear">Clear</button>
+                  </div>
+                  <div class="border rounded p-2" id="act-dev-list"></div>
+                </div>
+                <div class="col-lg-7">
+                  <div class="row g-2">
+                    <div class="col-md-6">
+                      <label class="form-label">Type</label>
+                      <input type="text" class="form-control form-control-sm" id="act-create-type" placeholder="send_down_frame">
+                    </div>
+                    <div class="col-md-6">
+                      <label class="form-label">Cancel after (ms)</label>
+                      <input type="number" class="form-control form-control-sm" id="act-create-cancel-after" placeholder="optional">
+                    </div>
+                    <div class="col-12">
+                      <label class="form-label">Options (JSON)</label>
+                      <textarea class="form-control form-control-sm font-monospace" id="act-create-opts" rows="5" placeholder='{"payload":"CAFE","port":1}'></textarea>
+                    </div>
+                    <div class="col-12">
+                      <div class="form-check">
+                        <input type="checkbox" class="form-check-input" id="act-create-override">
+                        <label class="form-check-label" for="act-create-override">Override pending actions</label>
+                      </div>
+                    </div>
+                    <div class="col-12">
+                      <label class="form-label d-block mb-2">Timing</label>
+                      <div class="d-flex flex-wrap gap-3">
+                        <div class="form-check">
+                          <input class="form-check-input" type="radio" name="act-create-timing" id="act-timing-immediate" value="immediate" checked>
+                          <label class="form-check-label" for="act-timing-immediate">Immediate</label>
+                        </div>
+                        <div class="form-check">
+                          <input class="form-check-input" type="radio" name="act-create-timing" id="act-timing-execute-at" value="execute_at">
+                          <label class="form-check-label" for="act-timing-execute-at">Execute at</label>
+                        </div>
+                        <div class="form-check">
+                          <input class="form-check-input" type="radio" name="act-create-timing" id="act-timing-cron" value="cron">
+                          <label class="form-check-label" for="act-timing-cron">Cron schedule</label>
+                        </div>
+                      </div>
+                    </div>
+                    <div class="col-12 act-timing-panel d-none" id="act-execute-at-wrap">
+                      <label class="form-label">Execute at</label>
+                      <input type="datetime-local" class="form-control form-control-sm" id="act-create-execute-at">
+                      <div class="form-text">Timezone: <span id="act-browser-tz">UTC</span></div>
+                    </div>
+                    <div class="col-12 act-timing-panel d-none" id="act-cron-wrap">
+                      <div class="row g-2">
+                        <div class="col-md-7">
+                          <label class="form-label">Cron expression</label>
+                          <input type="text" class="form-control form-control-sm font-monospace" id="act-create-cron" placeholder="0 3 * * *">
+                        </div>
+                        <div class="col-md-5">
+                          <label class="form-label">Timezone</label>
+                          <select class="form-select form-select-sm" id="act-create-tz"></select>
+                        </div>
+                      </div>
+                      <div class="invalid-feedback d-block d-none" id="act-create-tz-err">Timezone is required for cron schedules.</div>
+                    </div>
+                    <div class="col-12">
+                      <button type="button" class="btn btn-primary" id="act-create-submit"><i class="bi bi-plus-circle me-1"></i>Create for Selected Devices</button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- API LOG -->
+      <section id="view-api-log" class="view-section">
+        <div class="d-flex align-items-center gap-3 mb-3">
+          <h4 class="mb-0"><i class="bi bi-clock-history me-2"></i>API Log</h4>
+          <div class="ms-auto d-flex gap-2">
+            <button type="button" class="btn btn-sm btn-outline-secondary" id="api-log-refresh"><i class="bi bi-arrow-clockwise me-1"></i>Refresh</button>
+            <button type="button" class="btn btn-sm btn-outline-danger" id="api-log-clear"><i class="bi bi-trash me-1"></i>Clear</button>
+            <button type="button" class="btn btn-sm btn-outline-secondary" id="api-log-export"><i class="bi bi-download me-1"></i>Export</button>
+          </div>
+        </div>
+        <div class="card mb-3">
+          <div class="card-body py-2">
+            <div class="row g-2 align-items-end">
+              <div class="col-md-4">
+                <label class="form-label small mb-1">Search</label>
+                <input type="text" class="form-control form-control-sm" id="api-log-search" placeholder="Search method, path, or status...">
+              </div>
+              <div class="col-md-2">
+                <button type="button" class="btn btn-sm btn-outline-secondary" id="api-log-search-btn">Search</button>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div id="api-log-empty" class="text-center py-5 text-muted">
+          <i class="bi bi-clock-history fs-1 d-block mb-3 opacity-25"></i>
+          <p>No API calls logged yet.</p>
+          <p class="small">API calls will appear here as you use the application.</p>
+        </div>
+        <div id="api-log-table-wrap" class="card d-none">
+          <div class="table-scroll-wrap" style="max-height: calc(100vh - 280px);">
+            <table class="table table-hover table-sm mb-0">
+              <thead>
+                <tr>
+                  <th>Method</th>
+                  <th>Path</th>
+                  <th>Status</th>
+                  <th>Duration</th>
+                  <th>Time</th>
+                  <th>URL</th>
+                </tr>
+              </thead>
+              <tbody id="api-log-tbody"></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+    </main>
+  </div>
+
+  <!-- Device Detail Offcanvas -->
+  <div class="offcanvas offcanvas-end" tabindex="-1" id="device-detail-offcanvas">
+    <div class="offcanvas-header border-bottom py-2">
+      <h5 class="offcanvas-title mb-0" id="detail-title">Device</h5>
+      <div class="d-flex gap-2 ms-2">
+        <button class="btn btn-sm btn-outline-secondary py-0" id="detail-edit-name" title="Rename"><i class="bi bi-pencil"></i></button>
+      </div>
+      <button type="button" class="btn-close ms-auto" data-bs-dismiss="offcanvas" aria-label="Close"></button>
+    </div>
+    <div class="offcanvas-body p-0 d-flex flex-column offcanvas-body-inner">
+      <ul class="nav nav-tabs px-3 pt-2 flex-shrink-0" id="detail-tabs">
+        <li class="nav-item"><a class="nav-link active" data-dtab="overview" href="#">Overview</a></li>
+        <li class="nav-item"><a class="nav-link" data-dtab="interfaces" href="#">Interfaces</a></li>
+        <li class="nav-item"><a class="nav-link" data-dtab="readings" href="#">Readings</a></li>
+        <li class="nav-item"><a class="nav-link" data-dtab="packets" href="#">Packets</a></li>
+        <li class="nav-item"><a class="nav-link" data-dtab="actions" href="#">Actions</a></li>
+      </ul>
+      <div class="flex-grow-1 overflow-auto p-3" id="detail-content"></div>
+    </div>
+  </div>
+
+  <!-- Confirm Modal -->
+  <div class="modal fade" id="confirm-modal" tabindex="-1">
+    <div class="modal-dialog"><div class="modal-content">
+      <div class="modal-header"><h5 class="modal-title" id="confirm-title">Confirm</h5><button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button></div>
+      <div class="modal-body" id="confirm-body"></div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+        <button type="button" class="btn btn-danger" id="confirm-ok">Confirm</button>
+      </div>
+    </div></div>
+  </div>
+
+  <!-- Bulk Action Modal -->
+  <div class="modal fade" id="bulk-action-modal" tabindex="-1">
+    <div class="modal-dialog"><div class="modal-content">
+      <div class="modal-header"><h5 class="modal-title" id="ba-title">Send Action</h5><button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button></div>
+      <div class="modal-body">
+        <div class="mb-3">
+          <label class="form-label">Action Type <small class="text-muted">(e.g. send_down_frame, create_packet, reboot)</small></label>
+          <input type="text" class="form-control" id="ba-type" placeholder="send_down_frame">
+        </div>
+        <div class="mb-3">
+          <label class="form-label">Options (JSON)</label>
+          <textarea class="form-control font-monospace" id="ba-opts" rows="4" placeholder='{"payload":"CAFE","port":1}'></textarea>
+          <div class="invalid-feedback" id="ba-opts-err"></div>
+        </div>
+        <div class="row g-2">
+          <div class="col-7">
+            <div class="form-check mt-2">
+              <input type="checkbox" class="form-check-input" id="ba-override">
+              <label class="form-check-label small" for="ba-override">Override pending actions</label>
+            </div>
+          </div>
+          <div class="col-5">
+            <label class="form-label small mb-1">Cancel after (ms)</label>
+            <input type="number" class="form-control form-control-sm" id="ba-cancel-after" placeholder="optional">
+          </div>
+        </div>
+        <div class="alert alert-warning mt-3 py-2 small mb-0">
+          <i class="bi bi-exclamation-triangle me-1"></i>Devices with multiple interfaces may fail if the action type is ambiguous. Check the progress log.
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+        <button type="button" class="btn btn-primary" id="ba-submit">Send to Selected</button>
+      </div>
+    </div></div>
+  </div>
+
+  <!-- Bulk Progress Modal -->
+  <div class="modal fade" id="bulk-prog-modal" tabindex="-1" data-bs-backdrop="static" data-bs-keyboard="false">
+    <div class="modal-dialog"><div class="modal-content">
+      <div class="modal-header py-2"><h5 class="modal-title" id="bp-title">Processing…</h5></div>
+      <div class="modal-body">
+        <div class="progress mb-2 progress-sm">
+          <div class="progress-bar progress-bar-striped progress-bar-animated" id="bp-bar"></div>
+        </div>
+        <div class="d-flex justify-content-between small text-muted mb-2">
+          <span id="bp-count">0 / 0</span>
+          <span id="bp-errs" class="text-danger"></span>
+        </div>
+        <div id="bulk-log"></div>
+      </div>
+      <div class="modal-footer py-2">
+        <button type="button" class="btn btn-secondary d-none" id="bp-close" data-bs-dismiss="modal">Close</button>
+      </div>
+    </div></div>
+  </div>
+
+  <!-- Bulk Profile Modal -->
+  <div class="modal fade" id="bulk-profile-modal" tabindex="-1">
+    <div class="modal-dialog modal-lg"><div class="modal-content">
+      <div class="modal-header"><h5 class="modal-title">Bulk Profile Edit</h5><button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button></div>
+      <div class="modal-body">
+        <div class="alert alert-warning py-2 d-none" id="bpe-load-note">Load devices with profile data first by using <strong>Load All</strong>.</div>
+        <div class="row g-3">
+          <div class="col-md-6">
+            <label class="form-label">Profile</label>
+            <select class="form-select" id="bpe-profile-sel" title="Select profile">
+              <option value="">Select profile…</option>
+            </select>
+          </div>
+          <div class="col-md-6">
+            <label class="form-label d-block">Operation</label>
+            <div class="d-flex gap-3 pt-2">
+              <div class="form-check">
+                <input class="form-check-input" type="radio" name="bpe-mode" id="bpe-mode-set" value="set" checked>
+                <label class="form-check-label" for="bpe-mode-set">Set / Update</label>
+              </div>
+              <div class="form-check">
+                <input class="form-check-input" type="radio" name="bpe-mode" id="bpe-mode-remove" value="remove">
+                <label class="form-check-label" for="bpe-mode-remove">Remove profile</label>
+              </div>
+            </div>
+          </div>
+          <div class="col-12">
+            <div id="bpe-fields" class="border rounded p-3 bg-light">
+              <div class="text-muted small">Select a profile to edit its fields.</div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+        <button type="button" class="btn btn-primary" id="bpe-apply">Apply</button>
+      </div>
+    </div></div>
+  </div>
+
+  <!-- Folder Form Modal -->
+  <div class="modal fade" id="folder-modal" tabindex="-1">
+    <div class="modal-dialog"><div class="modal-content">
+      <div class="modal-header"><h5 class="modal-title" id="folder-modal-title">New Folder</h5><button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button></div>
+      <div class="modal-body">
+        <input type="hidden" id="folder-edit-id">
+        <div class="mb-3">
+          <label class="form-label">Name</label>
+          <input type="text" class="form-control" id="folder-name" placeholder="e.g. Sensors / Weather">
+          <div class="form-text">Use <code>Parent / Child</code> (spaces around /) for nested folders.</div>
+        </div>
+        <div class="mb-3">
+          <label class="form-label">Color Hue (0–359)</label>
+          <div class="input-group">
+            <input type="number" class="form-control" id="folder-hue" min="0" max="359" value="200" aria-label="Color hue value">
+            <span id="hue-preview" class="input-group-text p-0" aria-hidden="true"></span>
+          </div>
+        </div>
+        <div class="mb-3">
+          <label class="form-label" for="folder-desc">Description <small class="text-muted">(optional)</small></label>
+          <textarea class="form-control" id="folder-desc" rows="2" placeholder="Optional folder description"></textarea>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+        <button type="button" class="btn btn-primary" id="folder-save">Save Folder</button>
+      </div>
+    </div></div>
+  </div>
+
+  <!-- Statistics Modal -->
+  <div class="modal fade" id="stats-modal" tabindex="-1">
+    <div class="modal-dialog modal-lg"><div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title" id="stats-modal-title">Statistics</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+      </div>
+      <div class="modal-body" id="stats-modal-body">
+        <div class="text-center py-5 text-muted">
+          <i class="bi bi-bar-chart fs-1 d-block mb-3 opacity-25"></i>
+          <p>Load data first to see statistics.</p>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
+      </div>
+    </div></div>
+  </div>
+
+  <script src="vendor/bootstrap.bundle.min.js"></script>
+  <script src="vendor/jquery.min.js"></script>
+  <script src="js/api-logger.js"></script>
+  <script src="js/api.js"></script>
+  <script src="js/components.js"></script>
+  <script src="js/views.js"></script>
+  <script src="js/app.js"></script>
+</body>
+</html>
