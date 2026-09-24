@@ -244,10 +244,18 @@ class ApiClient {
       if (res.status === 401) { lastError = 'Unauthorized (401): invalid API key'; break; }
       if (res.status === 403) { lastError = 'Forbidden (403): insufficient permissions'; break; }
       let data;
-      try { data = await res.json(); } catch { lastError = `HTTP ${res.status}: non-JSON response`; break; }
-      if (!res.ok) {
-        const msg = data?.errors ? JSON.stringify(data.errors) : (data?.message || res.statusText);
+      try { data = await res.json(); } catch { data = null; }
+      if (!res.ok || !data) {
+        // ELEMENT reports errors as { error: "..." } (500) or { errors: {...} } (422)
+        const msg = data?.errors ? JSON.stringify(data.errors) : (data?.error || data?.message || res.statusText || 'non-JSON response');
         lastError = `HTTP ${res.status}: ${msg}`;
+        // Transient server errors (e.g. "connection was closed by the pool") are retried with
+        // back-off; deterministic ones (crashes on a parameter/filter) are not.
+        const deterministic = /no function clause|AbacusSql|FunctionClause|not found/i.test(msg);
+        if (method === 'GET' && res.status >= 500 && !deterministic && attempt < 2) {
+          await sleep(1000 * 3 ** attempt);
+          continue;
+        }
         break;
       }
       if (this._logger) this._logger.log(method, url, path, res.status, Date.now() - startTime, null);

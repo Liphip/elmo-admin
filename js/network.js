@@ -24,13 +24,9 @@ const NET_GW_STATUS = {
   offline:   { label: 'Offline',   color: '#c92a2a' },
   external:  { label: 'External',  color: '#7048e8' },
 };
-// AbacusSql filters selecting devices with a gateway-management interface. Tried in order; the
-// first one the server accepts is used (ELEMENT has no device "type" filter on every instance).
-const NET_GW_FILTERS = ['interfaces[0].opts.gateway_id != null', 'text(interfaces[0].opts.gateway_id) != null'];
-const NET_GW_ID_FILTERS = [
-  ids => ids.map(id => `text(interfaces[0].opts.gateway_id) == "${id}"`).join(' || '),
-  ids => ids.map(id => `interfaces[0].opts.gateway_id == "${id}"`).join(' || '),
-];
+// Gateways outside the gateway scope are looked up via the documented by-eui selector (one
+// request each), at most this many per run.
+const NET_MAX_GW_LOOKUPS = 40;
 const NET_SCOPE_KEY = 'elmoNetworkScope';
 const NET_CACHE_MS = 15 * 60e3;          // reuse loaded packets / device lists for 15 minutes
 const NET_STREAM_MIN_DEVICES = 10;       // a folder stream is only worth it for this many devices
@@ -70,6 +66,7 @@ class NetworkView {
     this._pktCache = new Map();
     this._gwMiss = new Map();       // gateway EUI -> time of an unsuccessful lookup
     this._instCache = null;         // { at, list } driver instances
+    this._fullList = null;          // { at, list } unscoped device list from an own full scan
     this._selection = null;
     this._tab = 'devices';
     this._sort = { devices: { col: 'status', dir: 1 }, gateways: { col: 'devices', dir: -1 }, holes: { col: 'area', dir: -1 } };
@@ -270,42 +267,31 @@ class NetworkView {
     $('#net-cancel').toggleClass('d-none', !busy).prop('disabled', false).text('Cancel');
   }
 
-  // Fetches a list trying the given AbacusSql filters in order (null = no filter). Returns the
-  // items and the filter that worked; remembers the working filter per purpose.
-  async _fetchFiltered(path, params, filters, purpose, { maxItems = Infinity, label = 'Loading…' } = {}) {
-    const start = this._filterOk[purpose] ?? 0;
-    for (let k = start; k < filters.length; k++) {
-      const f = filters[k];
-      try {
-        const items = await this._api.fetchAllPages(path, f ? { ...params, filter: f } : params,
-          n => this._progress(`<span class="spinner-border spinner-border-sm me-1"></span>${esc(label)} ${n}`),
-          { maxItems, shouldStop: () => this._cancel });
-        this._filterOk[purpose] = k;
-        return items;
-      } catch (e) {
-        if (k === filters.length - 1 || !/HTTP 4\d\d/.test(e.message) || /\(40[13]\)/.test(e.message)) throw e;
-      }
-    }
-    return [];
-  }
-
-  // Loads the devices of a scope: per folder (/tags/:id/devices), else per mandate
-  // (mandate_id_is), else all; name via name_ilike. Results are re-checked client-side so a filter
-  // the server ignores can never widen the scope.
-  async _loadScope(scope, { filters = [null], purpose, maxItems = Infinity, label }) {
+  // Loads the devices of a scope with documented simple filters: per folder (/tags/:id/devices),
+  // else per mandate (mandate_id_is), else all; name via name_ilike. A fresh complete device list
+  // (Devices view or an earlier full scan) is filtered locally instead. Results are always
+  // re-checked client-side so an ignored filter can never widen the scope.
+  async _loadScope(scope, { maxItems = Infinity, label, useCache = true }) {
+    const full = useCache ? this._reusableDeviceList() : null;
+    if (full) return full.filter(d => this._inScope(d, scope)).slice(0, maxItems);
     const params = { limit: 100 };
     if (scope.name) params.name_ilike = `%${scope.name}%`;
+    const unscoped = !scope.folders.length && !scope.mandates.length && !scope.name;
     const sources = scope.folders.length ? scope.folders.map(id => ({ path: `/tags/${encodeURIComponent(id)}/devices`, params: {} }))
       : scope.mandates.length ? scope.mandates.map(id => ({ path: '/devices', params: { mandate_id_is: id } }))
       : [{ path: '/devices', params: {} }];
     const byId = new Map();
     for (const src of sources) {
       if (this._cancel) break;
-      const items = await this._fetchFiltered(src.path, { ...params, ...src.params }, filters, purpose, { maxItems: maxItems - byId.size, label });
+      const items = await this._api.fetchAllPages(src.path, { ...params, ...src.params },
+        n => this._progress(`<span class="spinner-border spinner-border-sm me-1"></span>${esc(label)} ${(byId.size + n).toLocaleString()}`),
+        { maxItems: maxItems - byId.size, shouldStop: () => this._cancel });
       items.forEach(d => byId.set(d.id, d));
       if (byId.size >= maxItems) break;
     }
-    return [...byId.values()].filter(d => this._inScope(d, scope));
+    const list = [...byId.values()];
+    if (unscoped && !this._cancel && list.length < maxItems) this._fullList = { at: Date.now(), list };
+    return list.filter(d => this._inScope(d, scope));
   }
 
   _inScope(d, scope) {
@@ -319,9 +305,27 @@ class NetworkView {
   _reusableDeviceList() {
     const dv = window._app?._devV;
     const st = this._state;
-    if (!dv || !st.isLoaded.devices || dv._hasMore || !st.devices.length) return null;
-    if (!st.devicesLoadedAt || Date.now() - st.devicesLoadedAt > NET_CACHE_MS) return null;
-    return st.devices;
+    if (dv && st.isLoaded.devices && !dv._hasMore && st.devices.length && st.devicesLoadedAt && Date.now() - st.devicesLoadedAt <= NET_CACHE_MS) return st.devices;
+    if (this._fullList && Date.now() - this._fullList.at <= NET_CACHE_MS) return this._fullList.list;
+    return null;
+  }
+
+  // Driver instance list: requested without parameters (ELEMENT crashes on pagination params
+  // here), at most once per server; failures are remembered so no request is wasted later.
+  async _lnsInstanceIds(useCache) {
+    const key = `elmoNoDriverInstances:${this._api.domain}`;
+    try { if (localStorage.getItem(key)) return null; } catch { /* ignore */ }
+    if (useCache && this._instCache && Date.now() - this._instCache.at < NET_CACHE_MS) return this._instCache.ids;
+    try {
+      const r = await this._api.get('/drivers/instances');
+      const list = Array.isArray(r.body) ? r.body : [];
+      const ids = new Set(list.filter(i => NetworkView.isElementLns(i.driver)).map(i => i.id));
+      this._instCache = { at: Date.now(), ids: ids.size ? ids : null };
+      return this._instCache.ids;
+    } catch {
+      try { localStorage.setItem(key, '1'); } catch { /* ignore */ }
+      return null;
+    }
   }
 
   _cachedPackets(d, { afterMs, perDevice, uplinks }) {
@@ -476,7 +480,6 @@ class NetworkView {
     const afterMs = Date.parse(after);
     this._saveScope();
     this._cancel = false;
-    this._filterOk = {};
     this._setBusy(true);
     const warnings = [];
     const reqStart = this._api.requestCount || 0;
@@ -484,29 +487,20 @@ class NetworkView {
     try {
       // 1. Devices in scope – reuses the complete, fresh list of the Devices view when available
       const reuse = useCache ? this._reusableDeviceList() : null;
-      const inDevScope = reuse
-        ? reuse.filter(d => this._inScope(d, devScope)).slice(0, maxDev)
-        : await this._loadScope(devScope, { purpose: 'dev', maxItems: maxDev, label: 'Loading devices…' });
+      const inDevScope = await this._loadScope(devScope, { maxItems: maxDev, label: 'Loading devices…', useCache });
       cancelled();
       if (inDevScope.length >= maxDev) warnings.push(`Device limit reached: only the first ${maxDev} devices were analysed. Narrow the device scope or raise "Max devices".`);
       let sensors = inDevScope.filter(d => !NetAnalysis.isGatewayDevice(d));
 
-      // 2. Only devices on an ELEMENT LNS driver instance
+      // 2. Only devices with an ELEMENT LNS interface – by driver instance when the key may list
+      //    them, otherwise recognised by the LNS interface options (no request needed)
       this._skipped = 0;
       if (lnsOnly) {
-        try {
-          const fresh = useCache && this._instCache && Date.now() - this._instCache.at < NET_CACHE_MS;
-          const inst = fresh ? this._instCache.list : await this._api.fetchAllPages('/drivers/instances', { limit: 100 }, null, { shouldStop: () => this._cancel });
-          this._instCache = { at: fresh ? this._instCache.at : Date.now(), list: inst };
-          const ids = new Set(inst.filter(i => NetworkView.isElementLns(i.driver)).map(i => i.id));
-          if (ids.size) {
-            const before = sensors.length;
-            sensors = sensors.filter(d => !Array.isArray(d.interfaces) || d.interfaces.some(i => ids.has(i.driver_instance_id)));
-            this._skipped = before - sensors.length;
-          } else warnings.push('No ELEMENT LNS driver instance is visible to this API key – all devices were analysed.');
-        } catch (e) {
-          warnings.push(`Driver instances could not be loaded (${esc(e.message)}) – all devices were analysed, not only ELEMENT LNS devices.`);
-        }
+        const ids = await this._lnsInstanceIds(useCache);
+        const isLns = i => (ids ? ids.has(i.driver_instance_id) : NetAnalysis.isLnsInterface(i));
+        const before = sensors.length;
+        sensors = sensors.filter(d => !Array.isArray(d.interfaces) || d.interfaces.some(isLns));
+        this._skipped = before - sensors.length;
       }
       cancelled();
 
@@ -516,11 +510,11 @@ class NetworkView {
       const addGw = d => { if (!gwSeen.has(d.id) && NetAnalysis.isGatewayDevice(d)) { gwSeen.add(d.id); gatewayDevices.push(d); } };
       inDevScope.filter(d => NetAnalysis.isGatewayDevice(d) && this._inScope(d, gwScope)).forEach(addGw);
       try {
-        const gws = reuse
-          ? reuse.filter(d => NetAnalysis.isGatewayDevice(d) && this._inScope(d, gwScope))
-          : await this._loadScope(gwScope, { filters: [...NET_GW_FILTERS, null], purpose: 'gw', maxItems: 10000, label: 'Loading gateways…' });
-        gws.forEach(addGw);
-        if (this._filterOk.gw === NET_GW_FILTERS.length) warnings.push('The server did not accept the gateway filter – all devices in the gateway scope were scanned. Restrict the gateway scope (e.g. to the gateway mandate) to reduce requests.');
+        const gwUnscoped = !gwScope.folders.length && !gwScope.mandates.length && !gwScope.name;
+        const hadFull = !!this._reusableDeviceList();
+        const gws = await this._loadScope(gwScope, { maxItems: 50000, label: 'Loading gateways (scanning devices)…', useCache: true });
+        gws.filter(d => NetAnalysis.isGatewayDevice(d)).forEach(addGw);
+        if (gwUnscoped && !hadFull) warnings.push('No gateway scope set: all devices were scanned to find gateways (cached for 15 minutes). Set the gateway scope to the mandate or folder holding your gateways to make this cheaper.');
       } catch (e) {
         if (e.message === 'cancelled') throw e;
         warnings.push(`Gateways could not be loaded (${esc(e.message)}). Gateways are identified from packets only.`);
@@ -545,26 +539,23 @@ class NetworkView {
           packetsByDevice.forEach(list => list.forEach(p => (p._gws || NetAnalysis.extractGateways(p)).forEach(g => { if (!known.has(g.id)) unseen.add(g.id); })));
           const recentMiss = id => useCache && Date.now() - (this._gwMiss.get(id) || 0) < NET_CACHE_MS;
           const ids = [...unseen].filter(id => NetAnalysis.isEuiLike(id) && !recentMiss(id));
-          for (let k = 0; k < ids.length && !this._cancel; k += 20) {
-            const batch = ids.slice(k, k + 20);
-            const variants = [...new Set(batch.flatMap(id => [id, id.toLowerCase(), id.replace(/^0{4}/, '')]))];
-            this._progress(`<span class="spinner-border spinner-border-sm me-1"></span>Looking up ${ids.length} gateway(s) seen in packets…`);
+          if (ids.length > NET_MAX_GW_LOOKUPS) warnings.push(`${ids.length} gateways seen in packets are outside the gateway scope – only ${NET_MAX_GW_LOOKUPS} were looked up. Widen the gateway scope (e.g. the gateway mandate) to include them.`);
+          let lookupErr = null, done = 0;
+          await runConcurrent(ids.slice(0, NET_MAX_GW_LOOKUPS), async id => {
+            if (this._cancel || lookupErr) return;
             try {
-              const found = await this._fetchFiltered('/devices', { limit: 100 }, NET_GW_ID_FILTERS.map(fn => fn(variants)), 'gwid', { label: 'Looking up gateways…', maxItems: batch.length + 10 });
-              const wanted = new Set(batch);
-              const matching = found.filter(d => NetAnalysis.gatewayIdsFromDevice(d).some(id => wanted.has(id)));
-              matching.forEach(addGw);
-              const hit = new Set(matching.flatMap(d => NetAnalysis.gatewayIdsFromDevice(d)));
-              batch.forEach(id => { if (!hit.has(id)) this._gwMiss.set(id, Date.now()); });
-              if (matching.length < found.length) {
-                warnings.push('The server ignored the gateway lookup filter – gateways outside the scope are shown as external. Widen the gateway scope instead.');
-                break;
-              }
+              const r = await this._api.get(`/devices/by-eui/${encodeURIComponent(id)}`, { limit: 10 });
+              const found = (Array.isArray(r.body) ? r.body : r.body ? [r.body] : []).filter(d => NetAnalysis.gatewayIdsFromDevice(d).includes(id));
+              found.forEach(addGw);
+              if (!found.length) this._gwMiss.set(id, Date.now());
             } catch (e) {
-              warnings.push(`Gateways outside the scope could not be looked up (${esc(e.message)}); they are shown as external.`);
-              break;
+              if (/HTTP 404/.test(e.message)) this._gwMiss.set(id, Date.now());
+              else lookupErr = e;
             }
-          }
+            done++;
+            this._progress(`<span class="spinner-border spinner-border-sm me-1"></span>Looking up gateways seen in packets… ${done} / ${Math.min(ids.length, NET_MAX_GW_LOOKUPS)}`);
+          }, 3);
+          if (lookupErr) warnings.push(`Gateways outside the scope could not be looked up (${esc(lookupErr.message)}); they are shown as external.`);
         }
       }
 

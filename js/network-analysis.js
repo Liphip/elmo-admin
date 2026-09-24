@@ -203,6 +203,14 @@ const NetAnalysis = (() => {
     return [...ids];
   }
 
+  // ELEMENT LNS interfaces: LoRaWAN device EUI plus LNS-specific options (seen on real instances:
+  // check_fcnt, class_c, rx2_dr, rx_delay, gw_whitelist, lns_session_context, net_id).
+  const LNS_OPT_KEYS = ['check_fcnt', 'class_c', 'rx2_dr', 'rx_delay', 'gw_whitelist', 'lns_session_context', 'net_id'];
+  function isLnsInterface(i) {
+    const o = i?.opts || {};
+    return typeof o.device_eui === 'string' && LNS_OPT_KEYS.some(k => k in o);
+  }
+
   function isGatewayDevice(device) {
     if (device?.type === 'gateway') return true;
     return (device?.interfaces || []).some(i => GW_OPT_KEYS.some(k => typeof i?.opts?.[k] === 'string' && i.opts[k]));
@@ -689,7 +697,7 @@ const NetAnalysis = (() => {
   return {
     SF_SNR_FLOOR, normalizeGwId, extractGateways, extractSf, linkMargin, gatewayIdsFromDevice,
     deviceLatLng, haversine, percentile, analyze, fitPathLoss, estimateCoverage, isEuiLike,
-    isGatewayDevice, gatewayLastPing, statsSummary, routerIdFromEntry, compactPacket, packetIntervalSecs, tsMs,
+    isGatewayDevice, isLnsInterface, gatewayLastPing, statsSummary, routerIdFromEntry, compactPacket, packetIntervalSecs, tsMs,
   };
 })();
 
