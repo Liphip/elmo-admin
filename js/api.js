@@ -222,6 +222,7 @@ class ApiClient {
       // Respect the bucket-based rate limit (default 50 requests / 10 s per API key).
       if (this._rlRemaining <= 2) { await sleep(Math.min(this._rlReset, 10000)); this._rlRemaining = 50; }
       let res;
+      this.requestCount = (this.requestCount || 0) + 1;
       try { res = await fetch(url, opts); }
       catch (e) {
         if (e instanceof TypeError) {

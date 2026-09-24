@@ -298,19 +298,15 @@
               </div>
               <div class="col-md-2">
                 <label class="form-label small mb-1">Type</label>
-                <select class="form-select form-select-sm" id="dev-filter-type" aria-label="Filter by device type">
-                  <option value="">All types</option>
-                  <option value="generic">Generic</option>
-                  <option value="sensor">Sensor</option>
-                  <option value="gateway">Gateway</option>
-                  <option value="virtual">Virtual</option>
+                <select class="form-select form-select-sm" id="dev-filter-type" aria-label="Filter by kind">
+                  <option value="">All</option>
+                  <option value="gateway">Gateways</option>
+                  <option value="device">Devices (no gateways)</option>
                 </select>
               </div>
               <div class="col-md-2">
                 <label class="form-label small mb-1">Folder</label>
-                <select class="form-select form-select-sm" id="dev-filter-folder" aria-label="Filter by folder">
-                  <option value="">All folders</option>
-                </select>
+                <div id="dev-filter-folder"></div>
               </div>
               <div class="col-md-1">
                 <label class="form-label small mb-1">Location</label>
@@ -322,9 +318,7 @@
               </div>
               <div class="col-md-2 d-none" id="dev-filter-mandate-wrap">
                 <label class="form-label small mb-1">Mandate</label>
-                <select class="form-select form-select-sm" id="dev-filter-mandate" aria-label="Filter by mandate">
-                  <option value="">All mandates</option>
-                </select>
+                <div id="dev-filter-mandate"></div>
               </div>
               <div class="col-md-1 d-flex gap-2 align-items-end">
                 <button type="button" class="btn btn-sm btn-outline-secondary" id="dev-filter-apply" title="Re-apply filters">Apply</button>
@@ -651,10 +645,54 @@
         <div class="card mb-3">
           <div class="card-body py-2">
             <div class="row g-2 align-items-end">
+              <div class="col-12 net-scope-label"><i class="bi bi-cpu me-1"></i>Devices</div>
               <div class="col-md-3">
-                <label class="form-label small mb-1" for="net-scope-folder">Folder</label>
-                <select class="form-select form-select-sm" id="net-scope-folder">
-                  <option value="">All devices</option>
+                <label class="form-label small mb-1">Mandates</label>
+                <div id="net-dev-mandates"></div>
+              </div>
+              <div class="col-md-4">
+                <label class="form-label small mb-1">Folders <small class="text-muted">(any of)</small></label>
+                <div id="net-dev-folders"></div>
+              </div>
+              <div class="col-md-3">
+                <label class="form-label small mb-1" for="net-dev-name">Name contains</label>
+                <input type="text" class="form-control form-control-sm" id="net-dev-name" placeholder="optional">
+              </div>
+              <div class="col-md-2">
+                <div class="form-check mb-1">
+                  <input class="form-check-input" type="checkbox" id="net-scope-lns" checked>
+                  <label class="form-check-label small" for="net-scope-lns" title="Only analyse devices with an interface on an ELEMENT LNS driver instance (skips wM-Bus, MQTT, virtual devices…)">Element LNS only</label>
+                </div>
+              </div>
+            </div>
+            <div class="row g-2 align-items-end mt-1">
+              <div class="col-12 net-scope-label"><i class="bi bi-broadcast-pin me-1"></i>Gateways <small class="text-muted text-lowercase fw-normal">(devices with a gateway-management interface)</small></div>
+              <div class="col-md-3">
+                <label class="form-label small mb-1">Mandates</label>
+                <div id="net-gw-mandates"></div>
+              </div>
+              <div class="col-md-4">
+                <label class="form-label small mb-1">Folders <small class="text-muted">(any of)</small></label>
+                <div id="net-gw-folders"></div>
+              </div>
+              <div class="col-md-3">
+                <label class="form-label small mb-1" for="net-gw-name">Name contains</label>
+                <input type="text" class="form-control form-control-sm" id="net-gw-name" placeholder="optional">
+              </div>
+              <div class="col-md-2">
+                <div class="form-check mb-1">
+                  <input class="form-check-input" type="checkbox" id="net-gw-lookup" checked>
+                  <label class="form-check-label small" for="net-gw-lookup" title="Gateways that received packets but are outside the gateway scope are looked up by EUI (one request per 20 gateways)">Also look up gateways seen in packets</label>
+                </div>
+              </div>
+            </div>
+            <div class="row g-2 align-items-end mt-1">
+              <div class="col-12 net-scope-label"><i class="bi bi-sliders me-1"></i>Data</div>
+              <div class="col-md-3">
+                <label class="form-label small mb-1" for="net-mode">Mode</label>
+                <select class="form-select form-select-sm" id="net-mode">
+                  <option value="links" selected>Gateway links (loads uplinks)</option>
+                  <option value="quick">Quick – ELEMENT statistics only</option>
                 </select>
               </div>
               <div class="col-md-2">
@@ -675,23 +713,18 @@
                 <input type="number" class="form-control form-control-sm" id="net-scope-maxdev" value="2000" min="10" max="20000">
               </div>
               <div class="col-md-3 d-flex gap-2 align-items-end">
-                <div class="d-flex flex-column me-1">
-                  <div class="form-check mb-0">
-                    <input class="form-check-input" type="checkbox" id="net-scope-lns" checked>
-                    <label class="form-check-label small" for="net-scope-lns" title="Only analyse devices with an interface on an ELEMENT LNS driver instance (skips wM-Bus, NB-IoT, virtual devices…)">Element LNS only</label>
-                  </div>
-                  <div class="form-check mb-0">
-                    <input class="form-check-input" type="checkbox" id="net-scope-uplinks" checked>
-                    <label class="form-check-label small" for="net-scope-uplinks" title="Only request packets with packet_type=up">Uplinks only</label>
-                  </div>
+                <div class="form-check mb-1 me-1">
+                  <input class="form-check-input" type="checkbox" id="net-scope-uplinks" checked>
+                  <label class="form-check-label small" for="net-scope-uplinks" title="Only request packets with packet_type=up">Uplinks only</label>
                 </div>
                 <button type="button" class="btn btn-sm btn-primary" id="net-analyze"><i class="bi bi-play-fill me-1"></i>Analyse</button>
                 <button type="button" class="btn btn-sm btn-outline-danger d-none" id="net-cancel">Cancel</button>
               </div>
             </div>
             <div class="small text-muted mt-2" id="net-progress">
-              Loads devices, gateways and recent uplinks from Element IoT, then rates every device ↔ gateway link by RSSI, SNR and link margin.
-              Requests are throttled to Element's rate limit — large scopes take a while (roughly one request per device).
+              Scopes are applied as API filters where possible (mandate, folder, name, gateway interface) to keep the number of requests low.
+              In <em>Gateway links</em> mode one request per device is needed; devices whose last uplink (ELEMENT statistics) is older than the time window are rated silent without a request.
+              <em>Quick</em> mode uses only ELEMENT's device statistics: no packet requests, but no per-gateway links and no reception estimate.
             </div>
           </div>
         </div>
@@ -711,12 +744,22 @@
             <div class="col-xl-8">
               <div class="card h-100">
                 <div class="card-header py-2">
-                  <div class="d-flex flex-wrap gap-3 align-items-center small">
+                  <div class="d-flex flex-wrap gap-2 align-items-center small">
+                    <span class="net-scope-label me-1" style="width:70px">Devices</span>
                     <div class="input-group input-group-sm net-search">
                       <span class="input-group-text"><i class="bi bi-search"></i></span>
-                      <input type="text" class="form-control" id="net-filter-q" placeholder="Name, slug or gateway EUI…" aria-label="Filter map">
+                      <input type="text" class="form-control" id="net-filter-q" placeholder="Name, slug or EUI…" aria-label="Filter devices">
                     </div>
                     <div class="d-flex flex-wrap gap-2" id="net-status-filters"></div>
+                  </div>
+                  <div class="d-flex flex-wrap gap-2 align-items-center small mt-2">
+                    <span class="net-scope-label me-1" style="width:70px">Gateways</span>
+                    <div class="input-group input-group-sm net-search">
+                      <span class="input-group-text"><i class="bi bi-search"></i></span>
+                      <input type="text" class="form-control" id="net-filter-gw" placeholder="Name or EUI…" aria-label="Filter gateways">
+                    </div>
+                    <div class="d-flex flex-wrap gap-2" id="net-gw-filters"></div>
+                    <div class="form-check form-check-inline m-0 ms-1" title="Hide gateways that received none of the visible devices"><input class="form-check-input" type="checkbox" id="net-gw-linked"><label class="form-check-label" for="net-gw-linked">Only linked to visible devices</label></div>
                   </div>
                   <div class="d-flex flex-wrap gap-3 align-items-center small mt-2">
                     <div class="form-check form-check-inline m-0"><input class="form-check-input" type="checkbox" id="net-l-gw" checked><label class="form-check-label" for="net-l-gw">Gateways</label></div>

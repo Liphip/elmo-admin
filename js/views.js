@@ -109,6 +109,10 @@ class DeviceView {
     this._loading = false;
     this._maxDevices = 500;
     this._bulkProfileModal = bootstrap.Modal.getOrCreateInstance(document.getElementById('bulk-profile-modal'));
+    this._folderMs = new MultiSelect('#dev-filter-folder', { placeholder: 'All folders' });
+    this._mandateMs = new MultiSelect('#dev-filter-mandate', { placeholder: 'All mandates' });
+    this._folderMs.onChange(() => this._filter());
+    this._mandateMs.onChange(() => this._filter());
     this._loadMaxDevices();
     this._bind();
   }
@@ -128,7 +132,7 @@ class DeviceView {
     $('#dev-stats').on('click', () => this.showStats());
     $('#dev-sel-all').on('change', e => this._selectAll(e.target.checked));
     $('#dev-filter-name').on('input', () => { clearTimeout(this._filterTimer); this._filterTimer = setTimeout(() => this._filter(), 300); });
-    $('#dev-filter-type, #dev-filter-folder, #dev-filter-mandate, #dev-filter-location').on('change', () => this._filter());
+    $('#dev-filter-type, #dev-filter-location').on('change', () => this._filter());
     $('#dev-filter-apply').on('click', () => this._filter());
     $('#dev-filter-regex').on('click', () => {
       this._regexSearch = !this._regexSearch;
@@ -137,7 +141,8 @@ class DeviceView {
     });
     $('#dev-filter-reset').on('click', () => {
       $('#dev-filter-name').val('');
-      $('#dev-filter-type, #dev-filter-folder, #dev-filter-mandate, #dev-filter-location').val('');
+      $('#dev-filter-type, #dev-filter-location').val('');
+      this._folderMs.values = []; this._mandateMs.values = [];
       this._regexSearch = false;
       $('#dev-filter-regex').removeClass('active');
       this._filter();
@@ -176,14 +181,14 @@ class DeviceView {
 
   populateFolderDropdowns() {
     const opts = this._state.tags.map(t => `<option value="${t.id}">${esc(t.name)}</option>`).join('');
-    $('#dev-filter-folder').html('<option value="">All folders</option>' + opts);
+    this._folderMs.setOptions(this._state.tags.map(t => ({ value: t.id, label: t.name })));
     $('#bulk-add-folder-sel, #bulk-rem-folder-sel').html('<option value="">Select folder…</option>' + opts);
   }
 
   populateMandateDropdown() {
-    const opts = this._state.mandates.map(m => `<option value="${m.id}">${esc(m.name)}</option>`).join('');
-    $('#dev-filter-mandate').html('<option value="">All mandates</option>' + opts);
-    $('#dev-filter-mandate-wrap').toggleClass('d-none', this._state.mandates.length <= 1);
+    const ids = this._state.mandates.length ? this._state.mandates.map(m => m.id) : [...new Set(this._state.tags.map(t => t.mandate_id).filter(Boolean))];
+    this._mandateMs.setOptions(ids.map(id => ({ value: id, label: this._state.mandateMap[id]?.name || `Mandate ${shortId(id)}` })));
+    $('#dev-filter-mandate-wrap').toggleClass('d-none', ids.length <= 1);
   }
 
   populateProfileDropdown() {
@@ -292,16 +297,16 @@ class DeviceView {
 
   _filter() {
     const q = $('#dev-filter-name').val() || '';
-    const type = $('#dev-filter-type').val(), fid = $('#dev-filter-folder').val(), mandateId = $('#dev-filter-mandate').val();
+    const type = $('#dev-filter-type').val(), fids = this._folderMs.values, mandateIds = this._mandateMs.values;
     const loc = $('#dev-filter-location').val();
     const matcher = buildSearchMatcher(q, this._regexSearch);
     let list = this._state.devices;
     if (q)    list = list.filter(d => matcher(d.name) || matcher(d.slug) || matcher(d.id) ||
       (d.interfaces || []).some(i => Object.entries(i.opts || {}).some(([k, v]) => /eui|address/i.test(k) && typeof v === 'string' && v && matcher(v))));
     if (loc)  list = list.filter(d => !!NetAnalysis.deviceLatLng(d) === (loc === 'with'));
-    if (type) list = list.filter(d => d.type === type);
-    if (fid)  list = list.filter(d => Array.isArray(d.tags) && d.tags.some(t => t.id === fid));
-    if (mandateId) list = list.filter(d => d.mandate_id === mandateId);
+    if (type) list = list.filter(d => NetAnalysis.isGatewayDevice(d) === (type === 'gateway'));
+    if (fids.length) list = list.filter(d => Array.isArray(d.tags) && d.tags.some(t => fids.includes(t.id)));
+    if (mandateIds.length) list = list.filter(d => mandateIds.includes(d.mandate_id));
     const dir = this._sortDir === 'asc' ? 1 : -1;
     const col = this._sortCol;
     const key = d => String(d[col] || '').toLowerCase();
@@ -326,7 +331,7 @@ class DeviceView {
         <td><input type="checkbox" class="form-check-input dev-cb" data-id="${d.id}" ${sel}></td>
         <td><a href="#" class="dev-open text-decoration-none" data-id="${d.id}">${esc(d.name||d.slug)}</a>${loc}</td>
         <td class="text-muted small d-none d-md-table-cell">${esc(d.slug)}</td>
-        <td>${typeBadge(d.type)}</td>
+        <td>${typeBadge(NetAnalysis.isGatewayDevice(d) ? 'gateway' : (d.type || 'device'))}</td>
         <td>${tags}</td>
         <td class="text-muted small d-none d-lg-table-cell">${fmtDate(d.inserted_at)}</td>
         <td>${getMandateLabel(this._state, d.mandate_id)}</td>
@@ -738,7 +743,7 @@ class TagView {
     } catch(e) { this._toast.show(`Delete failed: ${e.message}`, 'danger'); }
   }
   _viewDevices(id) {
-    $('#dev-filter-folder').val(id);
+    window._app._devV._folderMs.values = [id];
     window._app.navigateTo('devices');
     window._app._devV._filter();
   }
@@ -1190,7 +1195,7 @@ class DeviceDetailPanel {
       <div class="row g-3">
         <div class="col-6"><div class="small text-muted">Name</div><strong>${esc(d.name)}</strong></div>
         <div class="col-6"><div class="small text-muted">Slug</div><code>${esc(d.slug)}</code></div>
-        <div class="col-6"><div class="small text-muted">Type</div>${typeBadge(d.type)}</div>
+        <div class="col-6"><div class="small text-muted">Type</div>${typeBadge(NetAnalysis.isGatewayDevice(d) ? 'gateway' : (d.type || 'device'))}</div>
         <div class="col-6"><div class="small text-muted">Location</div><small>${esc(loc)}</small></div>
         <div class="col-12"><div class="small text-muted">ID</div><small class="font-monospace">${esc(d.id)}</small></div>
         <div class="col-12"><div class="small text-muted mb-1">Mandate</div>${mandate}</div>
@@ -1309,7 +1314,7 @@ class DeviceDetailPanel {
   // Which gateways received the most recent uplinks of this device (from packet gateway stats).
   async _renderReception() {
     const d = this._device;
-    if (d.type === 'gateway') {
+    if (NetAnalysis.isGatewayDevice(d)) {
       document.getElementById('detail-content').innerHTML = `<p class="text-muted">This is a gateway. To see which devices it receives, run an analysis in the
         <a href="#network" onclick="bootstrap.Offcanvas.getInstance(document.getElementById('device-detail-offcanvas'))?.hide()">Network</a> view and select it on the map.</p>`;
       return;
@@ -1318,7 +1323,7 @@ class DeviceDetailPanel {
     const packets = Array.isArray(r.body) ? r.body : [];
     const el = document.getElementById('detail-content');
     if (!packets.length) { el.innerHTML = '<p class="text-muted">No uplink packets found.</p>'; return; }
-    const gatewayDevices = this._state.devices.filter(x => x.type === 'gateway');
+    const gatewayDevices = this._state.devices.filter(x => NetAnalysis.isGatewayDevice(x));
     const res = NetAnalysis.analyze({ devices: [d], packetsByDevice: new Map([[d.id, packets]]), gatewayDevices });
     const st = res.devices[0];
     const links = [...st.links.values()].sort((a, b) => b.count - a.count);

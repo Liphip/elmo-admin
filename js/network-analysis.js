@@ -8,13 +8,13 @@ const NetAnalysis = (() => {
   // Demodulation SNR floor per LoRa spreading factor (dB). Link margin = SNR - floor.
   const SF_SNR_FLOOR = { 7: -7.5, 8: -10, 9: -12.5, 10: -15, 11: -17.5, 12: -20 };
 
-  const GW_ID_KEYS  = ['gateway_id', 'gw_id', 'gateway_eui', 'gw_eui', 'gweui', 'gatewayId', 'gateway.gateway_id', 'gateway.eui', 'gateway.id', 'eui', 'mac', 'id'];
+  const GW_ID_KEYS  = ['gateway_id', 'gw_id', 'gateway_eui', 'gw_eui', 'gweui', 'gatewayId', 'gateway.gateway_id', 'gateway.eui'];
   const GW_NAME_KEYS = ['gateway_name', 'name', 'gateway.name'];
   const RSSI_KEYS   = ['rssi', 'rssic', 'rssis', 'signal_rssi', 'gw_rssi'];
   const SNR_KEYS    = ['snr', 'lsnr', 'signal_snr', 'gw_snr'];
   const LAT_KEYS    = ['latitude', 'lat', 'location.latitude', 'location.lat', 'gateway.latitude', 'gateway.lat', 'gateway.location.latitude'];
   const LNG_KEYS    = ['longitude', 'lng', 'lon', 'location.longitude', 'location.lng', 'location.lon', 'gateway.longitude', 'gateway.lng', 'gateway.location.longitude'];
-  const SF_KEYS     = ['sf', 'spreading_factor', 'lora_sf', 'lora.sf', 'lora.spreading_factor', 'modulation.spreading_factor'];
+  const SF_KEYS     = ['sf', 'spreading_factor', 'lora_sf', 'region_meta.spreadingfactor', 'lora.sf', 'lora.spreading_factor', 'modulation.spreading_factor'];
   const DR_KEYS     = ['data_rate', 'datarate', 'datr', 'dr', 'lora.data_rate'];
 
   const num = v => {
@@ -47,8 +47,26 @@ const NetAnalysis = (() => {
     const s = String(v).trim();
     if (!s) return null;
     const compact = s.replace(/[\s:.-]/g, '');
-    if (/^[0-9a-fA-F]{12,16}$/.test(compact)) return compact.toUpperCase();
+    // 48-bit IDs (e.g. "7076FF05004E") are shown by ELEMENT LNS as zero-padded 64-bit EUIs.
+    if (/^[0-9a-fA-F]{12}$/.test(compact)) return compact.toUpperCase().padStart(16, '0');
+    if (/^[0-9a-fA-F]{13,16}$/.test(compact)) return compact.toUpperCase().padStart(16, '0');
     return s.toUpperCase();
+  }
+
+  // ELEMENT LNS meta.gateway_stats[] only carries router_id (number) and router_id_hex
+  // (the EUI string, hex-encoded as ASCII: "3030…3445" -> "00007076FF05004E").
+  function routerIdFromEntry(e) {
+    const hex = e?.router_id_hex;
+    if (typeof hex === 'string' && /^([0-9a-fA-F]{2})+$/.test(hex)) {
+      let ascii = '';
+      for (let k = 0; k < hex.length; k += 2) ascii += String.fromCharCode(parseInt(hex.slice(k, k + 2), 16));
+      if (/^[0-9a-fA-F]{12,16}$/.test(ascii)) return ascii;
+      if (hex.length === 16) return hex;
+    }
+    const n = e?.router_id;
+    if (typeof n === 'number' && Number.isSafeInteger(n) && n >= 0) return n.toString(16);
+    if (typeof n === 'string' && /^\d+$/.test(n)) { try { return BigInt(n).toString(16); } catch { /* ignore */ } }
+    return null;
   }
 
   const isEuiLike = id => /^[0-9A-F]{16}$/.test(id || '');
@@ -85,14 +103,16 @@ const NetAnalysis = (() => {
   function extractGateways(p) {
     const byId = new Map();
     gatewayCandidates(p).forEach(e => {
-      const id = normalizeGwId(pick(e, GW_ID_KEYS));
+      const id = normalizeGwId(pick(e, GW_ID_KEYS) ?? routerIdFromEntry(e));
       if (!id) return;
-      const coords = get(e, 'location.coordinates') || get(e, 'gateway.location.coordinates');
+      const gd = e.gateway_device && typeof e.gateway_device === 'object' ? e.gateway_device : null;
+      const coords = get(e, 'location.coordinates') || get(e, 'gateway.location.coordinates') || gd?.location?.coordinates;
       let lat = num(pick(e, LAT_KEYS)), lng = num(pick(e, LNG_KEYS));
       if ((lat == null || lng == null) && Array.isArray(coords)) { lng = num(coords[0]); lat = num(coords[1]); }
       const entry = {
         id,
-        name: pick(e, GW_NAME_KEYS) ?? null,
+        name: pick(e, GW_NAME_KEYS) ?? gd?.name ?? null,
+        deviceId: gd?.id ?? (typeof e.device_id === 'string' ? e.device_id : null),
         rssi: num(pick(e, RSSI_KEYS)),
         snr: num(pick(e, SNR_KEYS)),
         lat: lngLatValid(lat, lng) ? lat : null,
@@ -101,7 +121,7 @@ const NetAnalysis = (() => {
       const prev = byId.get(id);
       if (!prev) { byId.set(id, entry); return; }
       // Same gateway reported twice (old + new structure): merge, keep the best values.
-      for (const k of ['name', 'lat', 'lng']) if (prev[k] == null) prev[k] = entry[k];
+      for (const k of ['name', 'lat', 'lng', 'deviceId']) if (prev[k] == null) prev[k] = entry[k];
       if (entry.rssi != null && (prev.rssi == null || entry.rssi > prev.rssi)) prev.rssi = entry.rssi;
       if (entry.snr != null && (prev.snr == null || entry.snr > prev.snr)) prev.snr = entry.snr;
     });
@@ -118,13 +138,19 @@ const NetAnalysis = (() => {
     return null;
   }
 
+  // Tries every key (a DR index in "data_rate" must not hide "datr": "SF7BW125").
+  function sfFrom(obj) {
+    for (const k of SF_KEYS) { const v = sfFromValue(get(obj, k), true); if (v != null) return v; }
+    for (const k of DR_KEYS) { const v = sfFromValue(get(obj, k), false); if (v != null) return v; }
+    return null;
+  }
+
   function extractSf(p) {
-    const m = packetMeta(p);
-    const sf = sfFromValue(pick(m, SF_KEYS), true) ?? sfFromValue(pick(m, DR_KEYS), false);
+    const sf = sfFrom(packetMeta(p));
     if (sf != null) return sf;
     for (const g of gatewayCandidates(p)) {
-      const s = sfFromValue(pick(g, SF_KEYS), true) ?? sfFromValue(pick(g, DR_KEYS), false);
-      if (s != null) return s;
+      const v = sfFrom(g);
+      if (v != null) return v;
     }
     return null;
   }
@@ -137,20 +163,41 @@ const NetAnalysis = (() => {
 
   // Collects every gateway identifier a gateway device can be referenced by:
   // EUI-like interface options (Element LNS / GMS interfaces) plus EUIs embedded in slug/name.
+  // Gateways in ELEMENT are devices with a gateway-management (GMS) interface whose opts carry
+  // "gateway_id" (plus secret/use_probe). ELEMENT does not return a device "type" on every
+  // instance, so this interface is the reliable marker.
+  const GW_OPT_KEYS = ['gateway_id', 'gateway_eui', 'gw_eui'];
+
   function gatewayIdsFromDevice(device) {
     const ids = new Set();
     (device?.interfaces || []).forEach(i => {
-      Object.entries(i?.opts || {}).forEach(([k, v]) => {
-        if (!/eui|gateway|gw|mac/i.test(k) || typeof v !== 'string') return;
+      GW_OPT_KEYS.forEach(k => {
+        const v = i?.opts?.[k];
+        if (typeof v !== 'string') return;
         const id = normalizeGwId(v);
         if (isEuiLike(id)) ids.add(id);
       });
     });
-    [device?.slug, device?.name].forEach(s => {
-      const m = String(s || '').match(/[0-9a-fA-F]{16}/);
-      if (m) ids.add(m[0].toUpperCase());
-    });
+    // Fallback for devices typed "gateway" without such an interface: an EUI in slug or name.
+    // Never used when the interface provides the ID – slugs are often copied and wrong.
+    if (!ids.size && device?.type === 'gateway') {
+      [device?.name, device?.slug].forEach(s => {
+        const m = String(s || '').match(/[0-9a-fA-F]{16}/);
+        if (m && !ids.size) ids.add(m[0].toUpperCase());
+      });
+    }
     return [...ids];
+  }
+
+  function isGatewayDevice(device) {
+    if (device?.type === 'gateway') return true;
+    return (device?.interfaces || []).some(i => GW_OPT_KEYS.some(k => typeof i?.opts?.[k] === 'string' && i.opts[k]));
+  }
+
+  // Last packet-forwarder / probe ping of a gateway device (GMS statistics).
+  function gatewayLastPing(device) {
+    const s = device?.stats || {};
+    return s.last_packet_forwarder_ping || s.last_probe_ping || null;
   }
 
   function haversine(a, b) {
@@ -204,8 +251,39 @@ const NetAnalysis = (() => {
    * @param {object[]} input.gatewayDevices   devices of type "gateway"
    * @param {object} [input.thresholds]
    */
-  function analyze({ devices, packetsByDevice, gatewayDevices = [], thresholds = {} }) {
+  const tsMs = v => {
+    if (!v) return null;
+    const str = String(v);
+    const t = Date.parse(/T\d{2}:\d{2}(:\d{2}(\.\d+)?)?$/.test(str) ? `${str}Z` : str);
+    return Number.isFinite(t) ? t : null;
+  };
+
+  // ELEMENT keeps rolling statistics per device (device.stats): last uplink, averages of RSSI,
+  // SNR, SF and receiving gateways. Used for devices whose packets were not loaded.
+  function statsSummary(device) {
+    const s = device?.stats;
+    if (!s) return null;
+    const out = {
+      lastSeen: s.transceived_at || null,
+      rssiAvg: num(s.avg_rssi), snrAvg: num(s.avg_snr), sfAvg: num(s.avg_sf), gwAvg: num(s.avg_gw_count),
+      missed: num(s.missed_up_frames), nominal: typeof s.nominally_sending === 'boolean' ? s.nominally_sending : null,
+    };
+    out.margin = linkMargin(out.snrAvg, out.sfAvg);
+    return out;
+  }
+
+  /**
+   * @param {object} input
+   * @param {object[]} input.devices           devices to analyse
+   * @param {Map<string,object[]>} input.packetsByDevice  device id -> packets; devices without an
+   *        entry are rated from ELEMENT's device statistics instead (no gateway links then)
+   * @param {object[]} input.gatewayDevices    gateway devices (GMS interface with gateway_id)
+   * @param {string} [input.windowStart]       ISO start of the analysed time window
+   * @param {number} [input.onlineWindowMs]    max age of the last packet-forwarder ping for "online"
+   */
+  function analyze({ devices, packetsByDevice, gatewayDevices = [], thresholds = {}, windowStart = null, onlineWindowMs = 3600e3, now = Date.now() }) {
     const th = { rssiWeak: -118, marginWeak: 5, snrWeak: -5, ...thresholds };
+    const windowMs = tsMs(windowStart);
     const gwIndex = new Map();
     gatewayDevices.forEach(d => gatewayIdsFromDevice(d).forEach(id => { if (!gwIndex.has(id)) gwIndex.set(id, d); }));
 
@@ -236,11 +314,13 @@ const NetAnalysis = (() => {
     };
 
     const deviceStats = devices.map(device => {
+      const fromPackets = packetsByDevice.has(device.id);
       const packets = packetsByDevice.get(device.id) || [];
       const st = {
         device, id: device.id, name: device.name || device.slug, latlng: deviceLatLng(device),
         packets: packets.length, withGwInfo: 0, gwPerPacket: acc(), sf: acc(),
         links: new Map(), lastSeen: null, best: null, status: 'silent',
+        source: fromPackets ? 'packets' : 'stats', elementStats: statsSummary(device),
       };
       packets.forEach(p => {
         const t = p.transceived_at || p.inserted_at || null;
@@ -276,6 +356,21 @@ const NetAnalysis = (() => {
       st.sfAvg = avg(st.sf);
       st.gwAvg = avg(st.gwPerPacket);
       st.gwCount = st.links.size;
+      const es = st.elementStats;
+      if (st.source === 'stats') {
+        // Rated from ELEMENT statistics: averages over all receptions, no per-gateway detail.
+        st.lastSeen = es?.lastSeen || null;
+        st.sfAvg = es?.sfAvg ?? null; st.gwAvg = es?.gwAvg ?? null;
+        const recent = st.lastSeen && (windowMs == null || tsMs(st.lastSeen) >= windowMs);
+        st.summary = es && es.rssiAvg != null ? { rssiAvg: es.rssiAvg, snrAvg: es.snrAvg, margin: es.margin } : null;
+        if (!recent) st.status = 'silent';
+        else if (!st.summary) st.status = 'unknown';
+        else if (isWeak(st.summary, th)) st.status = 'weak';
+        else if (st.gwAvg != null && st.gwAvg < 1.5) st.status = 'single';
+        else st.status = 'good';
+        return st;
+      }
+      st.summary = st.best ? { rssiAvg: st.best.rssiAvg, snrAvg: st.best.snrAvg, margin: st.best.margin } : null;
       if (!st.packets) st.status = 'silent';
       else if (!st.gwCount) st.status = 'unknown';
       else if (isWeak(st.best, th)) st.status = 'weak';
@@ -300,7 +395,13 @@ const NetAnalysis = (() => {
       const d = distancesByGw.get(gw.key) || [];
       gw.range = d.length >= 3 ? percentile(d, 0.9) : (d.length ? Math.max(...d) : null);
       gw.maxDistance = d.length ? Math.max(...d) : null;
-      gw.status = gw.packets ? 'active' : (gw.inElement ? 'idle' : 'active');
+      gw.lastPing = gw.device ? gatewayLastPing(gw.device) : null;
+      const pingMs = tsMs(gw.lastPing);
+      gw.online = pingMs == null ? null : now - pingMs <= onlineWindowMs;
+      if (!gw.inElement) gw.status = 'external';
+      else if (gw.online === false) gw.status = 'offline';
+      else if (gw.packets) gw.status = 'receiving';
+      else gw.status = 'idle';
     });
 
     const gwList = [...gateways.values()];
@@ -316,7 +417,8 @@ const NetAnalysis = (() => {
 
     const counts = { good: 0, single: 0, weak: 0, silent: 0, unknown: 0 };
     deviceStats.forEach(st => { counts[st.status]++; });
-    const noGwInfo = deviceStats.filter(s => s.packets > 0).every(s => s.withGwInfo === 0) && deviceStats.some(s => s.packets > 0);
+    const withPk = deviceStats.filter(s => s.source === 'packets' && s.packets > 0);
+    const noGwInfo = withPk.length > 0 && withPk.every(s => s.withGwInfo === 0);
 
     return {
       thresholds: th,
@@ -328,6 +430,8 @@ const NetAnalysis = (() => {
         gateways: gwList.length,
         gatewaysActive: gwList.filter(g => g.packets > 0).length,
         gatewaysIdle: gwList.filter(g => g.status === 'idle').length,
+        gatewaysOffline: gwList.filter(g => g.status === 'offline').length,
+        fromStats: deviceStats.filter(d => d.source === 'stats').length,
         gatewaysForeign: gwList.filter(g => !g.inElement).length,
         packets: deviceStats.reduce((s, d) => s + d.packets, 0),
         counts,
@@ -412,10 +516,12 @@ const NetAnalysis = (() => {
     const maxCells = opts.maxCells ?? 60000;
     let cellMeters = opts.cellMeters ?? 250;
     const covered = th.rssiWeak + fade;
-    const gws = result.gateways.filter(g => g.latlng && g.packets > 0);
+    // Receiving gateways only; gateways that are offline right now are left out so outages show up.
+    const gws = result.gateways.filter(g => g.latlng && g.packets > 0 && g.status !== 'offline');
+    const offlineExcluded = result.gateways.filter(g => g.latlng && g.packets > 0 && g.status === 'offline');
     const devs = result.devices.filter(d => d.latlng);
     const model = fitPathLoss(result);
-    const base = { cellMeters, cells: [], regions: [], model, gateways: gws.length, thresholdCovered: covered, thresholdNone: th.rssiWeak };
+    const base = { cellMeters, cells: [], regions: [], model, gateways: gws.length, offlineExcluded, thresholdCovered: covered, thresholdNone: th.rssiWeak };
     const anchor = devs.length ? devs.map(d => d.latlng) : gws.map(g => g.latlng);
     if (!gws.length || (!anchor.length && !opts.bounds)) return base;
 
@@ -539,6 +645,7 @@ const NetAnalysis = (() => {
   return {
     SF_SNR_FLOOR, normalizeGwId, extractGateways, extractSf, linkMargin, gatewayIdsFromDevice,
     deviceLatLng, haversine, percentile, analyze, fitPathLoss, estimateCoverage, isEuiLike,
+    isGatewayDevice, gatewayLastPing, statsSummary, routerIdFromEntry,
   };
 })();
 

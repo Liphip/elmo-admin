@@ -18,12 +18,31 @@ const NET_DEFAULT_TILES = {
   url: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
   attribution: '&copy; <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a> contributors',
 };
+const NET_GW_STATUS = {
+  receiving: { label: 'Receiving', color: '#1c7ed6' },
+  idle:      { label: 'Idle',      color: '#74c0fc' },
+  offline:   { label: 'Offline',   color: '#c92a2a' },
+  external:  { label: 'External',  color: '#7048e8' },
+};
+// AbacusSql filters selecting devices with a gateway-management interface. Tried in order; the
+// first one the server accepts is used (ELEMENT has no device "type" filter on every instance).
+const NET_GW_FILTERS = ['interfaces[0].opts.gateway_id != null', 'text(interfaces[0].opts.gateway_id) != null'];
+const NET_GW_ID_FILTERS = [
+  ids => ids.map(id => `text(interfaces[0].opts.gateway_id) == "${id}"`).join(' || '),
+  ids => ids.map(id => `interfaces[0].opts.gateway_id == "${id}"`).join(' || '),
+];
+const NET_SCOPE_KEY = 'elmoNetworkScope';
 const NET_MAX_TABLE_ROWS = 1000;
 const NET_MAX_LINKS = 5000;
 
 function netStatusBadge(status) {
   const s = NET_STATUS[status] || NET_STATUS.unknown;
   return `<span class="badge net-badge" style="--c:${s.color}">${esc(s.label)}</span>`;
+}
+
+function netGwBadge(gw) {
+  const st = NET_GW_STATUS[gw.status] || NET_GW_STATUS.idle;
+  return `<span class="badge net-badge" style="--c:${st.color}">${esc(st.label)}</span>`;
 }
 
 function netGwLabel(gw) {
@@ -38,6 +57,14 @@ class NetworkView {
     this._sessionTiles = false;
     this._busy = false; this._cancel = false;
     this._statusFilter = new Set(Object.keys(NET_STATUS));
+    this._gwFilter = new Set(Object.keys(NET_GW_STATUS));
+    this._ms = {
+      devMandates: new MultiSelect('#net-dev-mandates', { placeholder: 'All mandates' }),
+      devFolders: new MultiSelect('#net-dev-folders', { placeholder: 'All folders' }),
+      gwMandates: new MultiSelect('#net-gw-mandates', { placeholder: 'All mandates' }),
+      gwFolders: new MultiSelect('#net-gw-folders', { placeholder: 'All folders' }),
+    };
+    this._scopeRestored = false;
     this._selection = null;
     this._tab = 'devices';
     this._sort = { devices: { col: 'status', dir: 1 }, gateways: { col: 'devices', dir: -1 }, holes: { col: 'area', dir: -1 } };
@@ -50,7 +77,14 @@ class NetworkView {
   _bind() {
     $('#net-analyze').on('click', () => this.analyze());
     $('#net-cancel').on('click', () => { this._cancel = true; $('#net-cancel').prop('disabled', true).text('Cancelling…'); });
-    $('#net-filter-q').on('input', () => { clearTimeout(this._filterTimer); this._filterTimer = setTimeout(() => this._renderAll(), 250); });
+    $('#net-filter-q, #net-filter-gw').on('input', () => { clearTimeout(this._filterTimer); this._filterTimer = setTimeout(() => this._renderAll(), 250); });
+    $('#net-gw-linked').on('change', () => this._renderAll());
+    $('#net-gw-filters').on('click', '.net-chip', e => {
+      const s = $(e.currentTarget).data('status');
+      this._gwFilter.has(s) ? this._gwFilter.delete(s) : this._gwFilter.add(s);
+      this._renderStatusFilters(); this._renderAll();
+    });
+    $('#net-mode').on('change', () => this._syncMode());
     $('#net-status-filters').on('click', '.net-chip', e => {
       const s = $(e.currentTarget).data('status');
       this._statusFilter.has(s) ? this._statusFilter.delete(s) : this._statusFilter.add(s);
@@ -100,10 +134,58 @@ class NetworkView {
 
   // ---------- lifecycle ----------
 
+  // Mandate and folder options for both scopes. Mandate-scoped API keys cannot list mandates, so
+  // mandates are then derived from the folders.
   populateFolderDropdown() {
-    const cur = $('#net-scope-folder').val();
-    const opts = this._state.tags.map(t => `<option value="${esc(t.id)}">${esc(t.name)}</option>`).join('');
-    $('#net-scope-folder').html('<option value="">All devices</option>' + opts).val(cur || '');
+    const mandateName = id => this._state.mandateMap[id]?.name || `Mandate ${shortId(id)}`;
+    const mandateIds = this._state.mandates.length ? this._state.mandates.map(m => m.id) : [...new Set(this._state.tags.map(t => t.mandate_id).filter(Boolean))];
+    const mOpts = mandateIds.map(id => ({ value: id, label: mandateName(id), hint: this._state.mandateMap[id]?.slug || '' }))
+      .sort((a, b) => a.label.localeCompare(b.label));
+    const multi = mandateIds.length > 1;
+    const fOpts = this._state.tags.map(t => ({ value: t.id, label: t.name, hint: multi && t.mandate_id ? mandateName(t.mandate_id) : '' }))
+      .sort((a, b) => a.label.localeCompare(b.label));
+    this._ms.devMandates.setOptions(mOpts); this._ms.gwMandates.setOptions(mOpts);
+    this._ms.devFolders.setOptions(fOpts); this._ms.gwFolders.setOptions(fOpts);
+    if (!this._scopeRestored) { this._restoreScope(); this._scopeRestored = true; }
+  }
+
+  _scope(prefix) {
+    return {
+      mandates: this._ms[`${prefix}Mandates`].values,
+      folders: this._ms[`${prefix}Folders`].values,
+      name: ($(`#net-${prefix}-name`).val() || '').trim(),
+    };
+  }
+
+  _saveScope() {
+    try {
+      localStorage.setItem(NET_SCOPE_KEY, JSON.stringify({
+        dev: this._scope('dev'), gw: this._scope('gw'), mode: $('#net-mode').val(), window: $('#net-scope-window').val(),
+        lns: $('#net-scope-lns').prop('checked'), lookup: $('#net-gw-lookup').prop('checked'),
+      }));
+    } catch { /* storage unavailable */ }
+  }
+
+  _restoreScope() {
+    try {
+      const s = JSON.parse(localStorage.getItem(NET_SCOPE_KEY) || 'null');
+      if (!s) return;
+      ['dev', 'gw'].forEach(p => {
+        this._ms[`${p}Mandates`].values = s[p]?.mandates || [];
+        this._ms[`${p}Folders`].values = s[p]?.folders || [];
+        $(`#net-${p}-name`).val(s[p]?.name || '');
+      });
+      if (s.mode) $('#net-mode').val(s.mode);
+      if (s.window) $('#net-scope-window').val(s.window);
+      if (typeof s.lns === 'boolean') $('#net-scope-lns').prop('checked', s.lns);
+      if (typeof s.lookup === 'boolean') $('#net-gw-lookup').prop('checked', s.lookup);
+      this._syncMode();
+    } catch { /* ignore */ }
+  }
+
+  _syncMode() {
+    const quick = $('#net-mode').val() === 'quick';
+    $('#net-scope-packets, #net-scope-uplinks, #net-gw-lookup').prop('disabled', quick);
   }
 
   onShow() {
@@ -181,102 +263,173 @@ class NetworkView {
     $('#net-cancel').toggleClass('d-none', !busy).prop('disabled', false).text('Cancel');
   }
 
+  // Fetches a list trying the given AbacusSql filters in order (null = no filter). Returns the
+  // items and the filter that worked; remembers the working filter per purpose.
+  async _fetchFiltered(path, params, filters, purpose, { maxItems = Infinity, label = 'Loading…' } = {}) {
+    const start = this._filterOk[purpose] ?? 0;
+    for (let k = start; k < filters.length; k++) {
+      const f = filters[k];
+      try {
+        const items = await this._api.fetchAllPages(path, f ? { ...params, filter: f } : params,
+          n => this._progress(`<span class="spinner-border spinner-border-sm me-1"></span>${esc(label)} ${n}`),
+          { maxItems, shouldStop: () => this._cancel });
+        this._filterOk[purpose] = k;
+        return items;
+      } catch (e) {
+        if (k === filters.length - 1 || !/HTTP 4\d\d/.test(e.message) || /\(40[13]\)/.test(e.message)) throw e;
+      }
+    }
+    return [];
+  }
+
+  // Loads the devices of a scope: per folder (/tags/:id/devices), else per mandate
+  // (mandate_id_is), else all; name via name_ilike. Results are re-checked client-side so a filter
+  // the server ignores can never widen the scope.
+  async _loadScope(scope, { filters = [null], purpose, maxItems = Infinity, label }) {
+    const params = { limit: 100 };
+    if (scope.name) params.name_ilike = `%${scope.name}%`;
+    const sources = scope.folders.length ? scope.folders.map(id => ({ path: `/tags/${encodeURIComponent(id)}/devices`, params: {} }))
+      : scope.mandates.length ? scope.mandates.map(id => ({ path: '/devices', params: { mandate_id_is: id } }))
+      : [{ path: '/devices', params: {} }];
+    const byId = new Map();
+    for (const src of sources) {
+      if (this._cancel) break;
+      const items = await this._fetchFiltered(src.path, { ...params, ...src.params }, filters, purpose, { maxItems: maxItems - byId.size, label });
+      items.forEach(d => byId.set(d.id, d));
+      if (byId.size >= maxItems) break;
+    }
+    return [...byId.values()].filter(d => this._inScope(d, scope));
+  }
+
+  _inScope(d, scope) {
+    if (scope.mandates.length && !scope.mandates.includes(d.mandate_id)) return false;
+    if (scope.folders.length && !(d.tags || []).some(t => scope.folders.includes(t.id))) return false;
+    if (scope.name && !String(d.name || '').toLowerCase().includes(scope.name.toLowerCase())) return false;
+    return true;
+  }
+
   async analyze() {
     if (this._busy) return;
     if (!this._api.apiKey) { this._toast.show('Configure API credentials first', 'warning'); return; }
-    const folderId = $('#net-scope-folder').val();
+    const devScope = this._scope('dev'), gwScope = this._scope('gw');
+    const quick = $('#net-mode').val() === 'quick';
     const hours = parseInt($('#net-scope-window').val(), 10) || 168;
     const perDevice = Math.max(1, Math.min(100, parseInt($('#net-scope-packets').val(), 10) || 20));
     const maxDev = Math.max(10, parseInt($('#net-scope-maxdev').val(), 10) || 2000);
     const uplinks = $('#net-scope-uplinks').prop('checked');
     const lnsOnly = $('#net-scope-lns').prop('checked');
+    const lookup = !quick && $('#net-gw-lookup').prop('checked');
     const after = new Date(Date.now() - hours * 3600e3).toISOString();
-    const shouldStop = () => this._cancel;
+    const afterMs = Date.parse(after);
+    this._saveScope();
     this._cancel = false;
+    this._filterOk = {};
     this._setBusy(true);
     const warnings = [];
+    const reqStart = this._api.requestCount || 0;
+    const cancelled = () => { if (this._cancel) throw new Error('cancelled'); };
     try {
       // 1. Devices in scope
-      const devPath = folderId ? `/tags/${encodeURIComponent(folderId)}/devices` : '/devices';
-      const devices = await this._api.fetchAllPages(devPath, { limit: 100 },
-        n => this._progress(`<span class="spinner-border spinner-border-sm me-1"></span>Loading devices… ${n}`),
-        { maxItems: maxDev, shouldStop });
-      if (this._cancel) throw new Error('cancelled');
-      if (devices.length >= maxDev) warnings.push(`Device limit reached: only the first ${maxDev} devices were analysed. Narrow the scope with a folder or raise "Max devices".`);
+      const inDevScope = await this._loadScope(devScope, { purpose: 'dev', maxItems: maxDev, label: 'Loading devices…' });
+      cancelled();
+      if (inDevScope.length >= maxDev) warnings.push(`Device limit reached: only the first ${maxDev} devices were analysed. Narrow the device scope or raise "Max devices".`);
+      let sensors = inDevScope.filter(d => !NetAnalysis.isGatewayDevice(d));
 
-      // Element LNS driver instances (used to skip devices that are not LoRaWAN via ELEMENT LNS)
-      let lnsIds = null;
+      // 2. Only devices on an ELEMENT LNS driver instance
+      this._skipped = 0;
       if (lnsOnly) {
         try {
-          const inst = await this._api.fetchAllPages('/drivers/instances', { limit: 100 }, null, { shouldStop });
-          const ids = inst.filter(i => NetworkView.isElementLns(i.driver)).map(i => i.id);
-          if (ids.length) lnsIds = new Set(ids);
-          else warnings.push('No ELEMENT LNS driver instance is visible to this API key – all devices were analysed.');
+          const inst = await this._api.fetchAllPages('/drivers/instances', { limit: 100 }, null, { shouldStop: () => this._cancel });
+          const ids = new Set(inst.filter(i => NetworkView.isElementLns(i.driver)).map(i => i.id));
+          if (ids.size) {
+            const before = sensors.length;
+            sensors = sensors.filter(d => !Array.isArray(d.interfaces) || d.interfaces.some(i => ids.has(i.driver_instance_id)));
+            this._skipped = before - sensors.length;
+          } else warnings.push('No ELEMENT LNS driver instance is visible to this API key – all devices were analysed.');
         } catch (e) {
           warnings.push(`Driver instances could not be loaded (${esc(e.message)}) – all devices were analysed, not only ELEMENT LNS devices.`);
         }
       }
+      cancelled();
 
-      // 2. Gateways (always the full gateway list visible to the key, not just the folder)
-      let gatewayDevices = devices.filter(d => d.type === 'gateway');
-      if (folderId || devices.length >= maxDev) {
-        try {
-          // Simple filter type_is=gateway; results are re-checked client-side.
-          const gws = await this._api.fetchAllPages('/devices', { limit: 100, type_is: 'gateway' },
-            n => this._progress(`<span class="spinner-border spinner-border-sm me-1"></span>Loading gateways… ${n}`),
-            { maxItems: 5000, shouldStop });
-          const seen = new Set(gatewayDevices.map(g => g.id));
-          gws.filter(g => g.type === 'gateway' && !seen.has(g.id)).forEach(g => gatewayDevices.push(g));
-        } catch (e) {
-          warnings.push(`Gateway devices could not be loaded (${esc(e.message)}). Gateways are identified from packet metadata only.`);
-        }
+      // 3. Gateways in gateway scope (server-side gateway filter, falls back to scanning)
+      const gatewayDevices = [];
+      const gwSeen = new Set();
+      const addGw = d => { if (!gwSeen.has(d.id) && NetAnalysis.isGatewayDevice(d)) { gwSeen.add(d.id); gatewayDevices.push(d); } };
+      inDevScope.filter(d => NetAnalysis.isGatewayDevice(d) && this._inScope(d, gwScope)).forEach(addGw);
+      try {
+        const gws = await this._loadScope(gwScope, { filters: [...NET_GW_FILTERS, null], purpose: 'gw', maxItems: 10000, label: 'Loading gateways…' });
+        gws.forEach(addGw);
+        if (this._filterOk.gw === NET_GW_FILTERS.length) warnings.push('The server did not accept the gateway filter – all devices in the gateway scope were scanned. Restrict the gateway scope (e.g. to the gateway mandate) to reduce requests.');
+      } catch (e) {
+        if (e.message === 'cancelled') throw e;
+        warnings.push(`Gateways could not be loaded (${esc(e.message)}). Gateways are identified from packets only.`);
       }
-      if (this._cancel) throw new Error('cancelled');
-      // Interface opts carry the gateway EUI – load them if the listing did not include interfaces.
-      const needIfaces = gatewayDevices.filter(g => !Array.isArray(g.interfaces));
-      if (needIfaces.length) {
-        this._progress(`<span class="spinner-border spinner-border-sm me-1"></span>Loading gateway interfaces… (${needIfaces.length})`);
-        await runConcurrent(needIfaces, async g => {
-          if (this._cancel) return;
-          const r = await this._api.get(`/devices/${g.id}/interfaces`, { limit: 100 });
-          g.interfaces = Array.isArray(r.body) ? r.body : [];
-        }, 3);
-      }
+      cancelled();
 
-      // 3. Recent uplinks per sensor
-      let sensors = devices.filter(d => d.type !== 'gateway');
-      if (lnsIds) {
-        const before = sensors.length;
-        sensors = sensors.filter(d => !Array.isArray(d.interfaces) || d.interfaces.some(i => lnsIds.has(i.driver_instance_id)));
-        if (before !== sensors.length) this._skipped = before - sensors.length;
-        else this._skipped = 0;
-      } else this._skipped = 0;
+      // 4. Uplinks per device – skipped for devices ELEMENT reports as silent for the whole window
       const packetsByDevice = new Map();
-      let done = 0;
-      const started = Date.now();
-      const res = await runConcurrent(sensors, async d => {
-        if (this._cancel) throw new Error('cancelled');
-        const params = { limit: perDevice, after, sort_direction: 'descending' };
-        if (uplinks) params.packet_type = 'up';
-        const r = await this._api.get(`/devices/${d.id}/packets`, params);
-        packetsByDevice.set(d.id, Array.isArray(r.body) ? r.body : []);
-        done++;
-        if (done % 5 === 0 || done === sensors.length) {
-          const eta = done ? Math.round((Date.now() - started) / done * (sensors.length - done) / 1000) : 0;
-          this._progress(`<span class="spinner-border spinner-border-sm me-1"></span>Loading packets… ${done} / ${sensors.length} devices${eta > 5 ? ` · ~${eta}s left` : ''}`);
-        }
-      }, 4);
-      if (this._cancel) warnings.push(`Analysis was cancelled after ${done} of ${sensors.length} devices – the remaining devices are shown as silent.`);
-      const failed = res.failed.filter(f => f.error !== 'cancelled');
-      if (failed.length) warnings.push(`Packets could not be loaded for ${failed.length} device(s) (e.g. ${esc(failed[0].item.name || failed[0].item.id)}: ${esc(failed[0].error)}). They are shown as silent.`);
+      let statsSilent = 0;
+      if (!quick) {
+        const todo = sensors.filter(d => {
+          const last = d.stats?.transceived_at;
+          if (last && Date.parse(/Z|[+-]\d\d:?\d\d$/.test(last) ? last : `${last}Z`) < afterMs) { statsSilent++; return false; }
+          return true;
+        });
+        let done = 0;
+        const started = Date.now();
+        const res = await runConcurrent(todo, async d => {
+          if (this._cancel) throw new Error('cancelled');
+          const params = { limit: perDevice, after, sort_direction: 'descending' };
+          if (uplinks) params.packet_type = 'up';
+          const r = await this._api.get(`/devices/${d.id}/packets`, params);
+          packetsByDevice.set(d.id, Array.isArray(r.body) ? r.body : []);
+          done++;
+          if (done % 5 === 0 || done === todo.length) {
+            const eta = done ? Math.round((Date.now() - started) / done * (todo.length - done) / 1000) : 0;
+            this._progress(`<span class="spinner-border spinner-border-sm me-1"></span>Loading packets… ${done} / ${todo.length} devices${statsSilent ? ` (${statsSilent} skipped: no uplink in window)` : ''}${eta > 5 ? ` · ~${eta}s left` : ''}`);
+          }
+        }, 4);
+        if (this._cancel) warnings.push(`Analysis was cancelled after ${done} of ${todo.length} devices – the remaining devices are rated from ELEMENT statistics.`);
+        const failed = res.failed.filter(f => f.error !== 'cancelled');
+        if (failed.length) warnings.push(`Packets could not be loaded for ${failed.length} device(s) (e.g. ${esc(failed[0].item.name || failed[0].item.id)}: ${esc(failed[0].error)}). They are rated from ELEMENT statistics.`);
 
-      this._raw = { devices: sensors, gatewayDevices, packetsByDevice, params: { folderId, hours, perDevice, uplinks } };
+        // 5. Gateways that received packets but are outside the gateway scope
+        if (lookup && !this._cancel) {
+          const known = new Set(gatewayDevices.flatMap(g => NetAnalysis.gatewayIdsFromDevice(g)));
+          const unseen = new Set();
+          packetsByDevice.forEach(list => list.forEach(p => NetAnalysis.extractGateways(p).forEach(g => { if (!known.has(g.id)) unseen.add(g.id); })));
+          const ids = [...unseen].filter(NetAnalysis.isEuiLike);
+          for (let k = 0; k < ids.length && !this._cancel; k += 20) {
+            const batch = ids.slice(k, k + 20);
+            const variants = [...new Set(batch.flatMap(id => [id, id.toLowerCase(), id.replace(/^0{4}/, '')]))];
+            this._progress(`<span class="spinner-border spinner-border-sm me-1"></span>Looking up ${ids.length} gateway(s) seen in packets…`);
+            try {
+              const found = await this._fetchFiltered('/devices', { limit: 100 }, NET_GW_ID_FILTERS.map(fn => fn(variants)), 'gwid', { label: 'Looking up gateways…', maxItems: batch.length + 10 });
+              const wanted = new Set(batch);
+              const matching = found.filter(d => NetAnalysis.gatewayIdsFromDevice(d).some(id => wanted.has(id)));
+              matching.forEach(addGw);
+              if (matching.length < found.length) {
+                warnings.push('The server ignored the gateway lookup filter – gateways outside the scope are shown as external. Widen the gateway scope instead.');
+                break;
+              }
+            } catch (e) {
+              warnings.push(`Gateways outside the scope could not be looked up (${esc(e.message)}); they are shown as external.`);
+              break;
+            }
+          }
+        }
+      }
+
+      this._raw = { devices: sensors, gatewayDevices, packetsByDevice, windowStart: after, params: { hours, perDevice, uplinks, quick } };
       if (this._skipped) warnings.push(`${this._skipped} device(s) without an ELEMENT LNS interface were skipped.`);
+      if (quick) warnings.push('Quick mode: devices are rated from ELEMENT statistics (averages over all receiving gateways). Per-gateway links and the reception estimate need <em>Gateway links</em> mode.');
       this._warnings = warnings;
       this._selection = null;
       this._recompute(true);
       const s = this._result.summary;
-      this._progress(`${this._cancel ? '<span class="text-warning">Partial result.</span> ' : ''}Analysed <strong>${s.packets}</strong> packets from <strong>${s.devices}</strong> devices and <strong>${s.gateways}</strong> gateways in the last ${hours < 48 ? `${hours} h` : `${Math.round(hours / 24)} days`}.`);
+      const reqs = (this._api.requestCount || 0) - reqStart;
+      this._progress(`${this._cancel ? '<span class="text-warning">Partial result.</span> ' : ''}Analysed <strong>${s.devices}</strong> devices and <strong>${s.gateways}</strong> gateways in the last ${hours < 48 ? `${hours} h` : `${Math.round(hours / 24)} days`}: ${quick ? 'ELEMENT statistics only' : `<strong>${s.packets}</strong> packets`}${s.fromStats && !quick ? `, ${s.fromStats} device(s) rated from ELEMENT statistics (no uplink in window)` : ''} · ${reqs} API request(s).`);
     } catch (e) {
       if (e.message === 'cancelled') this._progress('Analysis cancelled.');
       else { this._progress(`<span class="text-danger">Failed: ${esc(e.message)}</span>`); this._toast.show(`Network analysis: ${e.message}`, 'danger'); }
@@ -285,8 +438,10 @@ class NetworkView {
     }
   }
 
+  // ELEMENT LNS packets report driver "Platform.Drivers.ElementLns".
   static isElementLns(driver) {
     const d = String(driver || '');
+    if (/element_?lns/i.test(d)) return true;
     return /lns/i.test(d) && !/chirpstack|actility|thingpark|loriot|tracknet|ttn|thethings|kerlink|everynet/i.test(d);
   }
 
@@ -380,8 +535,8 @@ class NetworkView {
 
   // ---------- filtering ----------
 
-  _matcher() {
-    const q = ($('#net-filter-q').val() || '').trim().toLowerCase();
+  _matcher(inputId) {
+    const q = ($(inputId).val() || '').trim().toLowerCase();
     if (!q) return null;
     const qHex = q.replace(/[\s:.-]/g, '');
     return values => values.some(v => {
@@ -392,26 +547,21 @@ class NetworkView {
 
   _deviceSearchValues(st) {
     const vals = [st.name, st.device.slug, st.id];
-    (st.device.interfaces || []).forEach(i => Object.values(i?.opts || {}).forEach(v => { if (typeof v === 'string' && v.length <= 64) vals.push(v); }));
+    (st.device.interfaces || []).forEach(i => ['device_eui', 'device_address', 'join_eui'].forEach(k => { if (typeof i?.opts?.[k] === 'string') vals.push(i.opts[k]); }));
     return vals;
   }
 
+  // Devices and gateways are filtered independently.
   _visible() {
-    const m = this._matcher();
-    const gwMatch = m ? new Set(this._result.gateways.filter(g => m([g.key, g.name, ...(g.ids || [])])).map(g => g.key)) : null;
-    const devices = this._result.devices.filter(st => {
-      if (!this._statusFilter.has(st.status)) return false;
-      if (!m) return true;
-      if (m(this._deviceSearchValues(st))) return true;
-      return gwMatch.size > 0 && [...st.links.keys()].some(k => gwMatch.has(k));
-    });
-    let gateways = this._result.gateways;
-    if (m) {
+    const dm = this._matcher('#net-filter-q'), gm = this._matcher('#net-filter-gw');
+    const devices = this._result.devices.filter(st => this._statusFilter.has(st.status) && (!dm || dm(this._deviceSearchValues(st))));
+    let gateways = this._result.gateways.filter(g => this._gwFilter.has(g.status) && (!gm || gm([g.key, g.name, ...(g.ids || [])])));
+    if ($('#net-gw-linked').prop('checked')) {
       const linked = new Set();
       devices.forEach(st => st.links.forEach((_, k) => linked.add(k)));
-      gateways = gateways.filter(g => gwMatch.has(g.key) || (!gwMatch.size && linked.has(g.key)));
+      gateways = gateways.filter(g => linked.has(g.key));
     }
-    return { devices, gateways };
+    return { devices, gateways, gwKeys: new Set(gateways.map(g => g.key)) };
   }
 
   // ---------- rendering ----------
@@ -426,13 +576,16 @@ class NetworkView {
   }
 
   _renderStatusFilters() {
-    $('#net-status-filters').html(Object.entries(NET_STATUS).map(([k, s]) =>
-      `<button type="button" class="btn btn-sm net-chip ${this._statusFilter.has(k) ? 'active' : ''}" data-status="${k}" style="--c:${s.color}" title="Toggle ${esc(s.label)}"><span class="net-dot"></span>${esc(s.label)}</button>`).join(''));
+    const chips = (def, set) => Object.entries(def).map(([k, s]) =>
+      `<button type="button" class="btn btn-sm net-chip ${set.has(k) ? 'active' : ''}" data-status="${k}" style="--c:${s.color}" title="Toggle ${esc(s.label)}"><span class="net-dot"></span>${esc(s.label)}</button>`).join('');
+    $('#net-status-filters').html(chips(NET_STATUS, this._statusFilter));
+    $('#net-gw-filters').html(chips(NET_GW_STATUS, this._gwFilter));
   }
 
   _renderLegend() {
     const dev = Object.values(NET_STATUS).map(s => `<span><span class="net-dot" style="--c:${s.color}"></span>${esc(s.label)}</span>`).join('');
-    $('#net-legend').html(`${dev}<span class="ms-2"><span class="net-gw-legend"><i class="bi bi-broadcast-pin"></i></span>Gateway</span>
+    const gw = Object.entries(NET_GW_STATUS).map(([k, s]) => `<span><span class="net-gw-legend net-gw-${k}"><i class="bi bi-broadcast-pin"></i></span>${esc(s.label)}</span>`).join(' ');
+    $('#net-legend').html(`${dev}<span class="ms-2">Gateways: ${gw}</span>
       <span class="ms-2">Links: <span class="net-line" style="--c:${NET_LINK_COLOR.good}"></span>good <span class="net-line" style="--c:${NET_LINK_COLOR.ok}"></span>fair <span class="net-line" style="--c:${NET_LINK_COLOR.weak}"></span>weak</span>
       <span class="ms-2">Reception: ${Object.values(NET_CELL).map(c => `<span class="net-sq" style="--c:${c.color}"></span>${esc(c.label)}`).join(' ')}</span>`);
   }
@@ -445,7 +598,7 @@ class NetworkView {
         <div class="small text-muted">${esc(label)}</div><div class="fs-5 fw-semibold">${value}</div></div></div></div>`;
     $('#net-tiles').html([
       tile('Devices', `${s.devices}<small class="text-muted fs-6 fw-normal"> · ${s.located} on map</small>`, null, 'Devices without location are only listed in the table'),
-      tile('Gateways', `${s.gatewaysActive}<small class="text-muted"> / ${s.gateways} active</small>`, '#1c7ed6', `${s.gatewaysIdle} Element gateway(s) received nothing; ${s.gatewaysForeign} gateway(s) are not Element devices of this key`),
+      tile('Gateways', `${s.gatewaysActive}<small class="text-muted fs-6 fw-normal"> / ${s.gateways} receiving${s.gatewaysOffline ? ` · <span class="text-danger">${s.gatewaysOffline} offline</span>` : ''}</small>`, '#1c7ed6', `${s.gatewaysIdle} gateway(s) received none of the analysed devices; ${s.gatewaysForeign} gateway(s) are not visible to this API key; offline = no packet-forwarder ping for over 1 h`),
       tile('Good', `${c.good}${pct(c.good)}`, NET_STATUS.good.color),
       tile('Single gateway', `${c.single}${pct(c.single)}`, NET_STATUS.single.color, 'No redundancy – a single gateway outage makes these devices silent'),
       tile('Weak', `${c.weak}${pct(c.weak)}`, NET_STATUS.weak.color),
@@ -470,7 +623,7 @@ class NetworkView {
   }
 
   _gwIcon(gw, selected) {
-    const cls = !gw.packets ? 'idle' : (gw.inElement ? 'active' : 'foreign');
+    const cls = `net-gw-${gw.status}`;
     return L.divIcon({
       className: '',
       html: `<div class="net-gw-icon ${cls}${selected ? ' selected' : ''}"><i class="bi bi-broadcast-pin"></i></div>`,
@@ -515,7 +668,11 @@ class NetworkView {
     if (mode === 'all') {
       let n = 0;
       for (const st of devices) {
-        for (const link of st.links.values()) { if (n++ >= NET_MAX_LINKS) break; drawLink(st.latlng, link); }
+        for (const link of st.links.values()) {
+          if (!this._vis.gwKeys.has(link.gw.key)) continue;
+          if (n++ >= NET_MAX_LINKS) break;
+          drawLink(st.latlng, link);
+        }
         if (n >= NET_MAX_LINKS) break;
       }
     } else if (mode === 'selected' && sel) {
@@ -621,21 +778,26 @@ class NetworkView {
         <td class="text-end">${fmtNum(l.margin)}</td>
         <td class="text-end">${fmtDistance(l.distance)}</td></tr>`).join('');
     $('#net-sel-body').html(`
-      <div class="mb-2">${netStatusBadge(st.status)} ${typeBadge(st.device.type)}</div>
+      <div class="mb-2">${netStatusBadge(st.status)} ${getMandateLabel(this._state, st.device.mandate_id)}</div>
       <dl class="row mb-2 net-dl">
-        <dt class="col-6">Packets in window</dt><dd class="col-6">${st.packets}${st.packets && st.withGwInfo < st.packets ? ` <small class="text-muted">(${st.withGwInfo} with gw data)</small>` : ''}</dd>
+        ${st.source === 'packets' ? `<dt class="col-6">Packets in window</dt><dd class="col-6">${st.packets}${st.packets && st.withGwInfo < st.packets ? ` <small class="text-muted">(${st.withGwInfo} with gw data)</small>` : ''}</dd>` : '<dt class="col-12 fw-normal text-muted">Rated from ELEMENT device statistics – no packets loaded.</dt>'}
         <dt class="col-6">Last uplink</dt><dd class="col-6">${st.lastSeen ? `<span title="${esc(fmtDate(st.lastSeen))}">${fmtAgo(st.lastSeen)}</span>` : '—'}</dd>
         <dt class="col-6">Gateways / packet</dt><dd class="col-6">${fmtNum(st.gwAvg)}</dd>
         <dt class="col-6">Avg. spreading factor</dt><dd class="col-6">${st.sfAvg != null ? `SF${fmtNum(st.sfAvg)}` : '—'}</dd>
         <dt class="col-6">Nearest gateway</dt><dd class="col-6">${st.nearestGw ? `${fmtDistance(st.nearestGwDistance)} <small class="text-muted">(${esc(netGwLabel(st.nearestGw))})</small>` : '—'}</dd>
         ${st.latlng ? '' : '<dt class="col-12 text-warning fw-normal">Device has no location.</dt>'}
       </dl>
+      ${st.elementStats ? `<div class="small text-muted mb-1">ELEMENT statistics</div><dl class="row mb-2 net-dl">
+        <dt class="col-6">Avg. RSSI / SNR</dt><dd class="col-6">${fmtNum(st.elementStats.rssiAvg, 0)} dBm / ${fmtNum(st.elementStats.snrAvg)} dB</dd>
+        <dt class="col-6">Avg. gateways / SF</dt><dd class="col-6">${fmtNum(st.elementStats.gwAvg)} / ${st.elementStats.sfAvg != null ? `SF${fmtNum(st.elementStats.sfAvg)}` : '—'}</dd>
+        <dt class="col-6">Missed uplinks</dt><dd class="col-6">${st.elementStats.missed ?? '—'}${st.elementStats.nominal === false ? ' <span class="badge text-bg-warning">not sending nominally</span>' : ''}</dd>
+      </dl>` : ''}
       <div class="d-flex gap-2 mb-2">
         <button type="button" class="btn btn-sm btn-outline-primary net-open-device" data-id="${esc(st.id)}"><i class="bi bi-box-arrow-up-right me-1"></i>Device details</button>
         <button type="button" class="btn btn-sm btn-outline-secondary net-zoom-sel"><i class="bi bi-zoom-in me-1"></i>Zoom</button>
       </div>
       ${links.length ? `<div class="table-responsive"><table class="table table-sm mb-0"><thead><tr><th>Received by</th><th class="text-end">Pkt</th><th class="text-end">RSSI</th><th class="text-end">SNR</th><th class="text-end">Margin</th><th class="text-end">Dist.</th></tr></thead><tbody>${rows}</tbody></table></div>`
-        : `<p class="text-muted mb-0">${st.packets ? 'Packets carry no gateway statistics.' : 'No uplinks in the selected time window.'}</p>`}`);
+        : `<p class="text-muted mb-0">${st.source === 'stats' ? (st.status === 'silent' ? 'No uplink in the selected time window (ELEMENT statistics).' : 'Per-gateway links need <em>Gateway links</em> mode.') : (st.packets ? 'Packets carry no gateway statistics.' : 'No uplinks in the selected time window.')}</p>`}`);
   }
 
   _renderGatewaySelection(gw) {
@@ -652,8 +814,8 @@ class NetworkView {
         <td class="text-end">${fmtDistance(link.distance)}</td></tr>`).join('');
     $('#net-sel-body').html(`
       <div class="mb-2">
-        ${gw.packets ? '<span class="badge text-bg-success">receiving</span>' : '<span class="badge text-bg-secondary" title="No packet in the window was received by this gateway">idle</span>'}
-        ${gw.inElement ? '<span class="badge text-bg-primary">Element device</span>' : '<span class="badge text-bg-light border" title="Seen in packet metadata only – not a gateway device visible to this API key">external</span>'}
+        ${netGwBadge(gw)}
+        ${gw.inElement ? '' : '<span class="small text-muted ms-1">Seen in packets only – not a gateway device visible to this API key (or outside the gateway scope with lookup disabled).</span>'}
       </div>
       <dl class="row mb-2 net-dl">
         <dt class="col-5">EUI</dt><dd class="col-7 font-monospace small">${(gw.ids || [gw.key]).map(esc).join('<br>') || '—'}</dd>
@@ -662,7 +824,9 @@ class NetworkView {
         <dt class="col-5">Packets</dt><dd class="col-7">${gw.packets}</dd>
         <dt class="col-5">Avg. RSSI / SNR</dt><dd class="col-7">${fmtNum(gw.rssiAvg, 0)} dBm / ${fmtNum(gw.snrAvg)} dB</dd>
         <dt class="col-5" title="90th percentile distance of located devices received">Observed range</dt><dd class="col-7">${fmtDistance(gw.range)} <small class="text-muted">(max ${fmtDistance(gw.maxDistance)})</small></dd>
-        <dt class="col-5">Last packet</dt><dd class="col-7">${gw.lastSeen ? `<span title="${esc(fmtDate(gw.lastSeen))}">${fmtAgo(gw.lastSeen)}</span>` : '—'}</dd>
+        <dt class="col-5">Last packet</dt><dd class="col-7">${gw.lastSeen ? `<span title="${esc(fmtDate(gw.lastSeen))}">${fmtAgo(gw.lastSeen)}</span>` : '—'} <small class="text-muted">(of analysed devices)</small></dd>
+        <dt class="col-5" title="Last packet-forwarder ping reported by ELEMENT gateway management">Forwarder ping</dt><dd class="col-7">${gw.lastPing ? `<span class="${gw.online === false ? 'text-danger' : ''}" title="${esc(fmtDate(gw.lastPing))}">${fmtAgo(gw.lastPing)}</span>` : '—'}</dd>
+        ${gw.device?.mandate_id ? `<dt class="col-5">Mandate</dt><dd class="col-7">${getMandateLabel(this._state, gw.device.mandate_id)}</dd>` : ''}
         ${gw.latlng ? '' : '<dt class="col-12 text-warning fw-normal">Gateway location unknown.</dt>'}
       </dl>
       <div class="d-flex gap-2 mb-2">
@@ -710,13 +874,13 @@ class NetworkView {
     const ratingOrder = { hole: 0, marginal: 1, unknown: 2, good: 3 };
     if (this._tab === 'devices') return [
       { key: 'name', label: 'Device', val: s => (s.name || '').toLowerCase(), html: s => esc(s.name) + (s.latlng ? '' : ' <i class="bi bi-geo-alt text-muted opacity-50" title="No location"></i>') },
-      { key: 'status', label: 'Status', val: s => statusOrder[s.status], html: s => netStatusBadge(s.status) },
+      { key: 'status', label: 'Status', val: s => statusOrder[s.status], html: s => netStatusBadge(s.status) + (s.source === 'stats' ? ' <i class="bi bi-bar-chart-line text-muted" title="Rated from ELEMENT device statistics (no packets loaded)"></i>' : '') },
       { key: 'packets', label: 'Pkt', num: true, val: s => s.packets, html: s => s.packets },
-      { key: 'gws', label: 'Gateways', num: true, val: s => s.gwCount, html: s => s.gwCount },
+      { key: 'gws', label: 'Gateways', num: true, val: s => (s.source === 'stats' ? s.gwAvg ?? -1 : s.gwCount), html: s => (s.source === 'stats' ? (s.gwAvg != null && s.status !== 'silent' ? `<span title="Average receiving gateways (ELEMENT statistics)">⌀ ${fmtNum(s.gwAvg)}</span>` : '—') : s.gwCount) },
       { key: 'best', label: 'Best gateway', val: s => (s.best ? netGwLabel(s.best.gw) : '').toLowerCase(), html: s => (s.best ? esc(netGwLabel(s.best.gw)) : '—') },
-      { key: 'rssi', label: 'RSSI', num: true, val: s => s.best?.rssiAvg ?? -999, html: s => fmtNum(s.best?.rssiAvg, 0) },
-      { key: 'snr', label: 'SNR', num: true, val: s => s.best?.snrAvg ?? -999, html: s => fmtNum(s.best?.snrAvg) },
-      { key: 'margin', label: 'Margin', num: true, val: s => s.best?.margin ?? -999, html: s => fmtNum(s.best?.margin) },
+      { key: 'rssi', label: 'RSSI', num: true, val: s => s.summary?.rssiAvg ?? -999, html: s => fmtNum(s.summary?.rssiAvg, 0) },
+      { key: 'snr', label: 'SNR', num: true, val: s => s.summary?.snrAvg ?? -999, html: s => fmtNum(s.summary?.snrAvg) },
+      { key: 'margin', label: 'Margin', num: true, val: s => s.summary?.margin ?? -999, html: s => fmtNum(s.summary?.margin) },
       { key: 'sf', label: 'SF', num: true, val: s => s.sfAvg ?? 99, html: s => (s.sfAvg != null ? fmtNum(s.sfAvg) : '—') },
       { key: 'near', label: 'Nearest GW', num: true, val: s => s.nearestGwDistance ?? 1e12, html: s => fmtDistance(s.nearestGwDistance) },
       { key: 'last', label: 'Last uplink', val: s => s.lastSeen || '', html: s => (s.lastSeen ? `<span title="${esc(fmtDate(s.lastSeen))}">${fmtAgo(s.lastSeen)}</span>` : '—') },
@@ -724,7 +888,8 @@ class NetworkView {
     if (this._tab === 'gateways') return [
       { key: 'name', label: 'Gateway', val: g => netGwLabel(g).toLowerCase(), html: g => esc(netGwLabel(g)) + (g.latlng ? '' : ' <i class="bi bi-geo-alt text-muted opacity-50" title="No location"></i>') },
       { key: 'eui', label: 'EUI', val: g => g.key, html: g => `<code class="small">${esc(g.key.startsWith('dev:') ? '—' : g.key)}</code>` },
-      { key: 'state', label: 'State', val: g => (g.packets ? 0 : 1), html: g => (g.packets ? '<span class="badge text-bg-success">receiving</span>' : '<span class="badge text-bg-secondary">idle</span>') + (g.inElement ? '' : ' <span class="badge text-bg-light border">external</span>') },
+      { key: 'state', label: 'State', val: g => Object.keys(NET_GW_STATUS).indexOf(g.status), html: g => netGwBadge(g) },
+      { key: 'ping', label: 'Fwd ping', val: g => g.lastPing || '', html: g => (g.lastPing ? `<span class="${g.online === false ? 'text-danger' : ''}" title="${esc(fmtDate(g.lastPing))}">${fmtAgo(g.lastPing)}</span>` : '—') },
       { key: 'devices', label: 'Devices', num: true, val: g => g.deviceCount, html: g => g.deviceCount },
       { key: 'sole', label: 'Only GW for', num: true, val: g => g.soleFor, html: g => (g.soleFor ? `<strong class="text-warning">${g.soleFor}</strong>` : 0) },
       { key: 'packets', label: 'Pkt', num: true, val: g => g.packets, html: g => g.packets },
@@ -770,7 +935,7 @@ class NetworkView {
     if (this._tab === 'holes' && this._cov) {
       const g = this._cov.model.global;
       const fit = g.fitted === 'full' ? `fitted from ${g.samples} links` : (g.fitted === 'intercept' ? `level fitted from ${g.samples} links, exponent assumed` : 'default model – too few located links');
-      foot = `Contiguous cells without reception (${fmtDistance(this._cov.cellMeters)} grid). Path-loss model: RSSI@1 km ${fmtNum(g.r1k, 0)} dBm, n = ${fmtNum(g.n)} (${fit}${g.residual != null ? `, scatter ±${fmtNum(g.residual)} dB` : ''}). Click a row to show the area.`;
+      foot = `Contiguous cells without reception (${fmtDistance(this._cov.cellMeters)} grid). Path-loss model: RSSI@1 km ${fmtNum(g.r1k, 0)} dBm, n = ${fmtNum(g.n)} (${fit}${g.residual != null ? `, scatter ±${fmtNum(g.residual)} dB` : ''}). Click a row to show the area.${this._cov.offlineExcluded?.length ? ` ${this._cov.offlineExcluded.length} gateway(s) that are offline now are excluded from the estimate.` : ''}`;
     } else foot = rows.length > NET_MAX_TABLE_ROWS ? `Showing ${NET_MAX_TABLE_ROWS} of ${rows.length} rows – use the filters or export CSV.` : `${rows.length} row(s)`;
     $('#net-table-foot').html(foot);
   }
@@ -781,9 +946,9 @@ class NetworkView {
 
   _exportDevices() {
     if (!this._result) return;
-    const rows = [['device_id', 'name', 'slug', 'status', 'latitude', 'longitude', 'packets', 'packets_with_gateway_data', 'gateways', 'gateways_per_packet', 'best_gateway', 'best_rssi_avg', 'best_snr_avg', 'best_margin', 'sf_avg', 'nearest_gateway', 'nearest_gateway_m', 'last_uplink']];
-    this._vis.devices.forEach(s => rows.push([s.id, s.name, s.device.slug, s.status, s.latlng?.[0], s.latlng?.[1], s.packets, s.withGwInfo, s.gwCount, s.gwAvg?.toFixed(2),
-      s.best ? netGwLabel(s.best.gw) : '', s.best?.rssiAvg?.toFixed(1), s.best?.snrAvg?.toFixed(1), s.best?.margin?.toFixed(1), s.sfAvg?.toFixed(1),
+    const rows = [['device_id', 'name', 'slug', 'mandate_id', 'source', 'status', 'latitude', 'longitude', 'packets', 'packets_with_gateway_data', 'gateways', 'gateways_per_packet', 'best_gateway', 'best_rssi_avg', 'best_snr_avg', 'best_margin', 'sf_avg', 'nearest_gateway', 'nearest_gateway_m', 'last_uplink']];
+    this._vis.devices.forEach(s => rows.push([s.id, s.name, s.device.slug, s.device.mandate_id, s.source, s.status, s.latlng?.[0], s.latlng?.[1], s.packets, s.withGwInfo, s.gwCount, s.gwAvg?.toFixed(2),
+      s.best ? netGwLabel(s.best.gw) : '', s.summary?.rssiAvg?.toFixed(1), s.summary?.snrAvg?.toFixed(1), s.summary?.margin?.toFixed(1), s.sfAvg?.toFixed(1),
       s.nearestGw ? netGwLabel(s.nearestGw) : '', s.nearestGwDistance?.toFixed(0), s.lastSeen]));
     downloadFile(`elmo-network-devices-${this._fileStamp()}.csv`, toCsv(rows), 'text/csv');
   }
@@ -797,8 +962,8 @@ class NetworkView {
 
   _exportGateways() {
     if (!this._result) return;
-    const rows = [['gateway_eui', 'name', 'element_device_id', 'latitude', 'longitude', 'packets', 'devices', 'only_gateway_for', 'rssi_avg', 'snr_avg', 'range_p90_m', 'max_distance_m', 'last_packet']];
-    this._vis.gateways.forEach(g => rows.push([g.key, g.name, g.device?.id, g.latlng?.[0], g.latlng?.[1], g.packets, g.deviceCount, g.soleFor, g.rssiAvg?.toFixed(1), g.snrAvg?.toFixed(1), g.range?.toFixed(0), g.maxDistance?.toFixed(0), g.lastSeen]));
+    const rows = [['gateway_eui', 'name', 'status', 'last_forwarder_ping', 'element_device_id', 'latitude', 'longitude', 'packets', 'devices', 'only_gateway_for', 'rssi_avg', 'snr_avg', 'range_p90_m', 'max_distance_m', 'last_packet']];
+    this._vis.gateways.forEach(g => rows.push([g.key, g.name, g.status, g.lastPing, g.device?.id, g.latlng?.[0], g.latlng?.[1], g.packets, g.deviceCount, g.soleFor, g.rssiAvg?.toFixed(1), g.snrAvg?.toFixed(1), g.range?.toFixed(0), g.maxDistance?.toFixed(0), g.lastSeen]));
     downloadFile(`elmo-network-gateways-${this._fileStamp()}.csv`, toCsv(rows), 'text/csv');
   }
 
