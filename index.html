@@ -81,7 +81,7 @@
             <li><strong>No data is transmitted to the developer.</strong> All API requests go directly from your browser to the Element IoT API.</li>
             <li>API credentials are stored only in your browser's localStorage (if you enable "Remember credentials").</li>
             <li>No analytics, tracking, or cookies are used.</li>
-            <li>The <strong>Network</strong> map loads map tiles from OpenStreetMap (configurable in <em>Configuration</em>). Only tile coordinates are requested — no device data is sent.</li>
+            <li>The <strong>Network</strong> map makes <strong>no external requests by default</strong>. A base map (OpenStreetMap tiles) is only loaded after you enable it on the map or in <em>Configuration</em>; then only tile coordinates are requested — no device data is sent.</li>
             <li>Device data is loaded into memory only and is cleared when you close the browser tab.</li>
           </ul>
         </div>
@@ -124,7 +124,8 @@
                 <ul class="small">
                   <li>Map of gateways and devices</li>
                   <li>Which gateway receives which device (RSSI, SNR, link margin)</li>
-                  <li>Find silent, weak and single-gateway devices and coverage holes</li>
+                  <li>Find silent, weak and single-gateway devices</li>
+                  <li>Estimate areas without reception — also where no devices exist yet</li>
                   <li>Export links and coverage cells as CSV</li>
                 </ul>
               </div>
@@ -245,9 +246,15 @@
                       <input type="number" class="form-control form-control-sm" id="cfg-max-devices" value="500" min="100" max="20000" style="width: 100px;">
                     </div>
                     <div class="col-12">
-                      <label class="form-label small mb-1" for="cfg-tile-url">Map tile URL <small class="text-muted">(Network view; leave empty for no base map)</small></label>
+                      <div class="form-check">
+                        <input class="form-check-input" type="checkbox" id="cfg-tiles-enabled">
+                        <label class="form-check-label small" for="cfg-tiles-enabled"><strong>Allow external map tiles</strong> — the Network view loads a base map from the tile server below. Your browser sends its IP address to that server. Off by default.</label>
+                      </div>
+                    </div>
+                    <div class="col-12">
+                      <label class="form-label small mb-1" for="cfg-tile-url">Map tile URL <small class="text-muted">(Network view)</small></label>
                       <input type="text" class="form-control form-control-sm font-monospace" id="cfg-tile-url" placeholder="https://tile.openstreetmap.org/{z}/{x}/{y}.png">
-                      <div class="form-text">Map tiles are loaded from this server by your browser. Default: OpenStreetMap.</div>
+                      <div class="form-text">Default: OpenStreetMap. Only used when external map tiles are allowed (here or per session on the map).</div>
                     </div>
                     <div class="col-12">
                       <label class="form-label small mb-1" for="cfg-tile-attr">Map attribution <small class="text-muted">(HTML)</small></label>
@@ -633,7 +640,8 @@
                 <li><a class="dropdown-item" href="#" id="net-export-devices"><i class="bi bi-filetype-csv me-1"></i>Devices (CSV)</a></li>
                 <li><a class="dropdown-item" href="#" id="net-export-links"><i class="bi bi-filetype-csv me-1"></i>Device ↔ gateway links (CSV)</a></li>
                 <li><a class="dropdown-item" href="#" id="net-export-gateways"><i class="bi bi-filetype-csv me-1"></i>Gateways (CSV)</a></li>
-                <li><a class="dropdown-item" href="#" id="net-export-holes"><i class="bi bi-filetype-csv me-1"></i>Coverage cells (CSV)</a></li>
+                <li><a class="dropdown-item" href="#" id="net-export-holes"><i class="bi bi-filetype-csv me-1"></i>No-reception areas (CSV)</a></li>
+                <li><a class="dropdown-item" href="#" id="net-export-cells"><i class="bi bi-filetype-csv me-1"></i>Reception grid cells (CSV)</a></li>
               </ul>
             </div>
           </div>
@@ -667,9 +675,15 @@
                 <input type="number" class="form-control form-control-sm" id="net-scope-maxdev" value="2000" min="10" max="20000">
               </div>
               <div class="col-md-3 d-flex gap-2 align-items-end">
-                <div class="form-check mb-1 me-1">
-                  <input class="form-check-input" type="checkbox" id="net-scope-uplinks" checked>
-                  <label class="form-check-label small" for="net-scope-uplinks" title="Only request packets with packet_type=up">Uplinks only</label>
+                <div class="d-flex flex-column me-1">
+                  <div class="form-check mb-0">
+                    <input class="form-check-input" type="checkbox" id="net-scope-lns" checked>
+                    <label class="form-check-label small" for="net-scope-lns" title="Only analyse devices with an interface on an ELEMENT LNS driver instance (skips wM-Bus, NB-IoT, virtual devices…)">Element LNS only</label>
+                  </div>
+                  <div class="form-check mb-0">
+                    <input class="form-check-input" type="checkbox" id="net-scope-uplinks" checked>
+                    <label class="form-check-label small" for="net-scope-uplinks" title="Only request packets with packet_type=up">Uplinks only</label>
+                  </div>
                 </div>
                 <button type="button" class="btn btn-sm btn-primary" id="net-analyze"><i class="bi bi-play-fill me-1"></i>Analyse</button>
                 <button type="button" class="btn btn-sm btn-outline-danger d-none" id="net-cancel">Cancel</button>
@@ -715,13 +729,21 @@
                         <option value="none">Off</option>
                       </select>
                     </div>
-                    <div class="form-check form-check-inline m-0"><input class="form-check-input" type="checkbox" id="net-l-grid"><label class="form-check-label" for="net-l-grid">Coverage grid</label></div>
-                    <select class="form-select form-select-sm net-inline-sel" id="net-grid-size" aria-label="Grid cell size">
-                      <option value="250">250 m</option>
-                      <option value="500" selected>500 m</option>
+                    <div class="form-check form-check-inline m-0" title="Estimated reception per grid cell: fitted to your measured links, overridden by device evidence where devices exist"><input class="form-check-input" type="checkbox" id="net-l-grid" checked><label class="form-check-label" for="net-l-grid">Reception map</label></div>
+                    <select class="form-select form-select-sm net-inline-sel" id="net-grid-size" aria-label="Grid cell size" title="Cell size">
+                      <option value="100">100 m</option>
+                      <option value="250" selected>250 m</option>
+                      <option value="500">500 m</option>
                       <option value="1000">1 km</option>
-                      <option value="2000">2 km</option>
                     </select>
+                    <select class="form-select form-select-sm net-inline-sel" id="net-area" aria-label="Analysed area" title="Area in which reception is estimated">
+                      <option value="1000" selected>Devices + 1 km</option>
+                      <option value="5000">Devices + 5 km</option>
+                      <option value="15000">Devices + 15 km</option>
+                      <option value="view">Current map view</option>
+                    </select>
+                    <button type="button" class="btn btn-sm btn-outline-secondary py-0 d-none" id="net-area-refresh" title="Use the current map view as analysed area"><i class="bi bi-bounding-box"></i></button>
+                    <div class="form-check form-check-inline m-0"><input class="form-check-input" type="checkbox" id="net-l-covered"><label class="form-check-label" for="net-l-covered">Show covered</label></div>
                     <div class="form-check form-check-inline m-0" title="Circle = distance within which a gateway received 90% of its located devices"><input class="form-check-input" type="checkbox" id="net-l-range"><label class="form-check-label" for="net-l-range">Observed range</label></div>
                     <button type="button" class="btn btn-sm btn-outline-secondary ms-auto py-0" id="net-fit" title="Zoom to all visible"><i class="bi bi-arrows-fullscreen me-1"></i>Fit</button>
                   </div>
@@ -747,9 +769,10 @@
                       <li><span class="net-dot" style="--c:var(--net-single)"></span><strong>Single gateway</strong> — only one gateway hears it: no redundancy.</li>
                       <li><span class="net-dot" style="--c:var(--net-weak)"></span><strong>Weak</strong> — best link below the RSSI or link-margin threshold.</li>
                       <li><span class="net-dot" style="--c:var(--net-silent)"></span><strong>Silent</strong> — no uplink in the time window.</li>
-                      <li><span class="net-dot" style="--c:var(--net-unknown)"></span><strong>No gateway data</strong> — packets carry no gateway stats (driver dependent).</li>
+                      <li><span class="net-dot" style="--c:var(--net-unknown)"></span><strong>No gateway data</strong> — packets carry no gateway stats (e.g. created manually or via API).</li>
                     </ul>
-                    <p class="mb-0 text-muted">Link margin = SNR − demodulation floor of the spreading factor (SF7 −7.5 dB … SF12 −20 dB).</p>
+                    <p class="mb-2 text-muted">Link margin = SNR − demodulation floor of the spreading factor (SF7 −7.5 dB … SF12 −20 dB).</p>
+                    <p class="mb-0 text-muted"><strong>Reception map:</strong> a log-distance path-loss model (RSSI = RSSI<sub>1 km</sub> − 10·n·log<sub>10</sub>(d)) is fitted to the measured links, per gateway where enough data exists. Each cell gets the best predicted RSSI of all receiving gateways: <em>none</em> below the weak RSSI threshold, <em>marginal</em> within the fade margin, <em>single</em>/<em>covered</em> for one/two or more gateways above it. Where devices exist, their measured rating overrides the prediction. Terrain and buildings are only reflected through the fit — treat areas without devices as an estimate.</p>
                   </details>
                   <details>
                     <summary class="text-muted">Thresholds</summary>
@@ -757,7 +780,8 @@
                       <div class="col-6"><label class="form-label small mb-1" for="net-th-rssi">Weak RSSI below (dBm)</label><input type="number" class="form-control form-control-sm" id="net-th-rssi" value="-118"></div>
                       <div class="col-6"><label class="form-label small mb-1" for="net-th-margin">Weak margin below (dB)</label><input type="number" class="form-control form-control-sm" id="net-th-margin" value="5"></div>
                       <div class="col-6"><label class="form-label small mb-1" for="net-th-snr" title="Used when the spreading factor is unknown">Weak SNR below (dB)</label><input type="number" class="form-control form-control-sm" id="net-th-snr" value="-5"></div>
-                      <div class="col-6 d-flex align-items-end"><button type="button" class="btn btn-sm btn-outline-primary w-100" id="net-th-apply">Re-rate</button></div>
+                      <div class="col-6"><label class="form-label small mb-1" for="net-th-fade" title="Predicted RSSI must exceed the weak threshold by this much to count as covered (shadowing, fading)">Fade margin (dB)</label><input type="number" class="form-control form-control-sm" id="net-th-fade" value="8"></div>
+                      <div class="col-12 d-flex align-items-end"><button type="button" class="btn btn-sm btn-outline-primary w-100" id="net-th-apply">Re-rate</button></div>
                     </div>
                   </details>
                 </div>
@@ -769,7 +793,7 @@
           <ul class="nav nav-tabs" id="net-tabs">
             <li class="nav-item"><a class="nav-link active" href="#" data-ntab="devices">Devices <span class="badge bg-secondary" id="net-tab-dev-count">0</span></a></li>
             <li class="nav-item"><a class="nav-link" href="#" data-ntab="gateways">Gateways <span class="badge bg-secondary" id="net-tab-gw-count">0</span></a></li>
-            <li class="nav-item"><a class="nav-link" href="#" data-ntab="holes">Coverage holes <span class="badge bg-danger" id="net-tab-hole-count">0</span></a></li>
+            <li class="nav-item"><a class="nav-link" href="#" data-ntab="holes">No-reception areas <span class="badge bg-danger" id="net-tab-hole-count">0</span></a></li>
           </ul>
           <div class="card border-top-0 rounded-top-0">
             <div class="table-scroll-wrap net-table-wrap">

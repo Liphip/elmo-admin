@@ -8,7 +8,12 @@ const NET_STATUS = {
   unknown: { label: 'No gateway data', color: '#868e96' },
 };
 const NET_LINK_COLOR = { good: '#2f9e44', ok: '#e8a400', weak: '#e03131' };
-const NET_CELL_COLOR = { good: '#2f9e44', marginal: '#e8a400', hole: '#e03131', unknown: '#868e96' };
+const NET_CELL = {
+  none:     { label: 'No reception', color: '#e03131', rgba: [224, 49, 49, 115] },
+  marginal: { label: 'Marginal',     color: '#f76707', rgba: [247, 103, 7, 90] },
+  single:   { label: 'Single gateway', color: '#e8a400', rgba: [232, 164, 0, 55] },
+  covered:  { label: 'Covered',      color: '#2f9e44', rgba: [47, 158, 68, 45] },
+};
 const NET_DEFAULT_TILES = {
   url: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
   attribution: '&copy; <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a> contributors',
@@ -29,12 +34,13 @@ class NetworkView {
   constructor(api, state, toast, detail) {
     this._api = api; this._state = state; this._toast = toast; this._detail = detail;
     this._map = null; this._layers = null; this._tileLayer = null;
-    this._raw = null; this._result = null; this._grid = [];
+    this._raw = null; this._result = null; this._cov = null; this._viewBounds = null;
+    this._sessionTiles = false;
     this._busy = false; this._cancel = false;
     this._statusFilter = new Set(Object.keys(NET_STATUS));
     this._selection = null;
     this._tab = 'devices';
-    this._sort = { devices: { col: 'status', dir: 1 }, gateways: { col: 'devices', dir: -1 }, holes: { col: 'rating', dir: 1 } };
+    this._sort = { devices: { col: 'status', dir: 1 }, gateways: { col: 'devices', dir: -1 }, holes: { col: 'area', dir: -1 } };
     this._filterTimer = null;
     this._bind();
     this._renderStatusFilters();
@@ -51,7 +57,15 @@ class NetworkView {
       this._renderStatusFilters(); this._renderAll();
     });
     $('#net-l-gw, #net-l-dev, #net-l-links, #net-l-range').on('change', () => this._renderMap());
-    $('#net-l-grid, #net-grid-size').on('change', () => { this._rebuildGrid(); this._renderMap(); this._renderTable(); });
+    $('#net-l-grid, #net-l-covered').on('change', () => this._renderMap());
+    $('#net-grid-size').on('change', () => this._updateCoverage());
+    $('#net-area').on('change', () => {
+      const view = $('#net-area').val() === 'view';
+      $('#net-area-refresh').toggleClass('d-none', !view);
+      if (view) this._viewBounds = this._currentViewBounds();
+      this._updateCoverage();
+    });
+    $('#net-area-refresh').on('click', () => { this._viewBounds = this._currentViewBounds(); this._updateCoverage(); });
     $('#net-fit').on('click', () => this._fit());
     $('#net-sel-clear').on('click', () => this._select(null));
     $('#net-th-apply').on('click', () => { if (this._raw) { this._recompute(); this._toast.show('Devices re-rated with new thresholds', 'info'); } });
@@ -68,7 +82,6 @@ class NetworkView {
     });
     $('#net-tbody').on('click', 'tr[data-kind]', e => {
       const tr = e.currentTarget;
-      if (tr.dataset.kind === 'cell') { this._zoomCell(tr.dataset.id); return; }
       this._select({ kind: tr.dataset.kind, id: tr.dataset.id }, true);
     });
     $('#net-sel-body').on('click', '[data-select-kind]', e => {
@@ -80,7 +93,9 @@ class NetworkView {
     $('#net-export-devices').on('click', e => { e.preventDefault(); this._exportDevices(); });
     $('#net-export-links').on('click', e => { e.preventDefault(); this._exportLinks(); });
     $('#net-export-gateways').on('click', e => { e.preventDefault(); this._exportGateways(); });
-    $('#net-export-holes').on('click', e => { e.preventDefault(); this._exportCells(); });
+    $('#net-export-holes').on('click', e => { e.preventDefault(); this._exportAreas(); });
+    $('#net-export-cells').on('click', e => { e.preventDefault(); this._exportCells(); });
+    $('#net-sel-body').on('click', '.net-zoom-area', e => { e.preventDefault(); this._zoomArea(e.currentTarget.dataset.id); });
   }
 
   // ---------- lifecycle ----------
@@ -96,19 +111,43 @@ class NetworkView {
     setTimeout(() => this._map && this._map.invalidateSize(), 50);
   }
 
+  // External map tiles are opt-in: nothing is requested from a tile server unless the user
+  // enabled it in Configuration or clicked "Load base map" for this session.
   applyTileSettings() {
     if (!this._map) return;
     if (this._tileLayer) { this._map.removeLayer(this._tileLayer); this._tileLayer = null; }
     const cfg = NetworkView.tileSettings();
-    if (cfg.url) this._tileLayer = L.tileLayer(cfg.url, { maxZoom: 19, attribution: cfg.attribution }).addTo(this._map);
+    const on = !!cfg.url && (cfg.enabled || this._sessionTiles);
+    if (on) this._tileLayer = L.tileLayer(cfg.url, { maxZoom: 19, attribution: cfg.attribution }).addTo(this._map);
+    $('#net-map').toggleClass('net-no-tiles', !on);
+    this._renderTileControl(on, cfg);
+  }
+
+  _renderTileControl(on, cfg) {
+    if (!this._tileCtl) {
+      const Ctl = L.Control.extend({ onAdd: () => { const d = L.DomUtil.create('div', 'net-tile-ctl leaflet-bar'); L.DomEvent.disableClickPropagation(d); return d; } });
+      this._tileCtl = new Ctl({ position: 'topright' }).addTo(this._map);
+      $(this._tileCtl.getContainer()).on('click', 'button', e => {
+        this._sessionTiles = e.currentTarget.dataset.act === 'on';
+        if (!this._sessionTiles && NetworkView.tileSettings().enabled) this._toast.show('External map tiles are enabled permanently in Configuration', 'info');
+        this.applyTileSettings();
+      });
+    }
+    let host = '';
+    try { host = new URL(cfg.url.replace(/\{[a-z]\}/g, 'a')).host; } catch {}
+    const el = this._tileCtl.getContainer();
+    if (!cfg.url) el.innerHTML = '<div class="p-2 small text-muted">No tile server configured</div>';
+    else if (on) el.innerHTML = `<button type="button" class="btn btn-sm btn-light" data-act="off" title="Stop loading map tiles"><i class="bi bi-map me-1"></i>Hide base map</button>`;
+    else el.innerHTML = `<div class="p-2 small"><div class="mb-1 text-muted">Base map off – no external requests.</div>
+      <button type="button" class="btn btn-sm btn-primary" data-act="on"><i class="bi bi-map me-1"></i>Load base map</button>
+      <div class="text-muted mt-1" style="max-width:220px">Loads tiles from <code>${esc(host)}</code> for this session; your IP address is sent to that server.</div></div>`;
   }
 
   static tileSettings() {
     try {
       const s = JSON.parse(localStorage.getItem('deviceAdminSettings') || '{}');
-      if (s.tileUrl === '') return { url: '', attribution: '' };
-      return { url: s.tileUrl || NET_DEFAULT_TILES.url, attribution: s.tileAttribution ?? NET_DEFAULT_TILES.attribution };
-    } catch { return { ...NET_DEFAULT_TILES }; }
+      return { url: s.tileUrl ?? NET_DEFAULT_TILES.url, attribution: s.tileAttribution ?? NET_DEFAULT_TILES.attribution, enabled: s.externalTiles === true };
+    } catch { return { ...NET_DEFAULT_TILES, enabled: false }; }
   }
 
   _ensureMap() {
@@ -118,6 +157,7 @@ class NetworkView {
     this._renderer = L.canvas({ padding: 0.3 });
     this._layers = {
       grid: L.layerGroup().addTo(this._map),
+      area: L.layerGroup().addTo(this._map),
       range: L.layerGroup().addTo(this._map),
       links: L.layerGroup().addTo(this._map),
       dev: L.layerGroup().addTo(this._map),
@@ -125,6 +165,10 @@ class NetworkView {
       hl: L.layerGroup().addTo(this._map),
     };
     L.control.scale({ imperial: false }).addTo(this._map);
+    const Info = L.Control.extend({ onAdd: () => L.DomUtil.create('div', 'net-cell-info d-none') });
+    this._infoCtl = new Info({ position: 'bottomleft' }).addTo(this._map);
+    this._map.on('mousemove', e => this._showCellInfo(e.latlng));
+    this._map.on('mouseout', () => $(this._infoCtl.getContainer()).addClass('d-none'));
   }
 
   // ---------- loading ----------
@@ -145,6 +189,7 @@ class NetworkView {
     const perDevice = Math.max(1, Math.min(100, parseInt($('#net-scope-packets').val(), 10) || 20));
     const maxDev = Math.max(10, parseInt($('#net-scope-maxdev').val(), 10) || 2000);
     const uplinks = $('#net-scope-uplinks').prop('checked');
+    const lnsOnly = $('#net-scope-lns').prop('checked');
     const after = new Date(Date.now() - hours * 3600e3).toISOString();
     const shouldStop = () => this._cancel;
     this._cancel = false;
@@ -158,6 +203,19 @@ class NetworkView {
         { maxItems: maxDev, shouldStop });
       if (this._cancel) throw new Error('cancelled');
       if (devices.length >= maxDev) warnings.push(`Device limit reached: only the first ${maxDev} devices were analysed. Narrow the scope with a folder or raise "Max devices".`);
+
+      // Element LNS driver instances (used to skip devices that are not LoRaWAN via ELEMENT LNS)
+      let lnsIds = null;
+      if (lnsOnly) {
+        try {
+          const inst = await this._api.fetchAllPages('/drivers/instances', { limit: 100 }, null, { shouldStop });
+          const ids = inst.filter(i => NetworkView.isElementLns(i.driver)).map(i => i.id);
+          if (ids.length) lnsIds = new Set(ids);
+          else warnings.push('No ELEMENT LNS driver instance is visible to this API key – all devices were analysed.');
+        } catch (e) {
+          warnings.push(`Driver instances could not be loaded (${esc(e.message)}) – all devices were analysed, not only ELEMENT LNS devices.`);
+        }
+      }
 
       // 2. Gateways (always the full gateway list visible to the key, not just the folder)
       let gatewayDevices = devices.filter(d => d.type === 'gateway');
@@ -186,7 +244,13 @@ class NetworkView {
       }
 
       // 3. Recent uplinks per sensor
-      const sensors = devices.filter(d => d.type !== 'gateway');
+      let sensors = devices.filter(d => d.type !== 'gateway');
+      if (lnsIds) {
+        const before = sensors.length;
+        sensors = sensors.filter(d => !Array.isArray(d.interfaces) || d.interfaces.some(i => lnsIds.has(i.driver_instance_id)));
+        if (before !== sensors.length) this._skipped = before - sensors.length;
+        else this._skipped = 0;
+      } else this._skipped = 0;
       const packetsByDevice = new Map();
       let done = 0;
       const started = Date.now();
@@ -207,6 +271,7 @@ class NetworkView {
       if (failed.length) warnings.push(`Packets could not be loaded for ${failed.length} device(s) (e.g. ${esc(failed[0].item.name || failed[0].item.id)}: ${esc(failed[0].error)}). They are shown as silent.`);
 
       this._raw = { devices: sensors, gatewayDevices, packetsByDevice, params: { folderId, hours, perDevice, uplinks } };
+      if (this._skipped) warnings.push(`${this._skipped} device(s) without an ELEMENT LNS interface were skipped.`);
       this._warnings = warnings;
       this._selection = null;
       this._recompute(true);
@@ -220,6 +285,11 @@ class NetworkView {
     }
   }
 
+  static isElementLns(driver) {
+    const d = String(driver || '');
+    return /lns/i.test(d) && !/chirpstack|actility|thingpark|loriot|tracknet|ttn|thethings|kerlink|everynet/i.test(d);
+  }
+
   _thresholds() {
     const n = (id, d) => { const v = parseFloat($(id).val()); return Number.isFinite(v) ? v : d; };
     return { rssiWeak: n('#net-th-rssi', -118), marginWeak: n('#net-th-margin', 5), snrWeak: n('#net-th-snr', -5) };
@@ -229,7 +299,7 @@ class NetworkView {
     this._result = NetAnalysis.analyze({ ...this._raw, thresholds: this._thresholds() });
     this._devById = new Map(this._result.devices.map(d => [d.id, d]));
     this._gwByKey = new Map(this._result.gateways.map(g => [g.key, g]));
-    this._rebuildGrid();
+    this._computeCoverage();
     if (this._selection && !this._resolveSelection()) this._selection = null;
     $('#net-empty').addClass('d-none'); $('#net-content').removeClass('d-none');
     $('#net-export-btn').prop('disabled', false);
@@ -239,9 +309,73 @@ class NetworkView {
     if (fit) this._fit();
   }
 
-  _rebuildGrid() {
+  _currentViewBounds() {
+    if (!this._map) return null;
+    const b = this._map.getBounds();
+    return [[b.getSouth(), b.getWest()], [b.getNorth(), b.getEast()]];
+  }
+
+  _computeCoverage() {
     if (!this._result) return;
-    this._grid = NetAnalysis.buildGrid(this._result.devices, parseInt($('#net-grid-size').val(), 10) || 500);
+    const area = $('#net-area').val();
+    const fade = parseFloat($('#net-th-fade').val());
+    this._cov = NetAnalysis.estimateCoverage(this._result, {
+      cellMeters: parseInt($('#net-grid-size').val(), 10) || 250,
+      padMeters: area === 'view' ? 0 : parseInt(area, 10) || 1000,
+      bounds: area === 'view' ? this._viewBounds : null,
+      fadeMargin: Number.isFinite(fade) ? fade : 8,
+    });
+    this._covImage = null;
+    this._areaById = new Map(this._cov.regions.map(r => [r.id, r]));
+  }
+
+  _updateCoverage() {
+    if (!this._result) return;
+    this._computeCoverage();
+    if (this._selection?.kind === 'area' && !this._resolveSelection()) this._selection = null;
+    this._renderTiles(); this._renderMap(); this._renderSelection(); this._renderTable();
+  }
+
+  // Renders the reception grid into one image (one pixel per cell) – far cheaper than thousands of
+  // vector rectangles. The grid is regular in lat/lng; at city scale the Mercator distortion within
+  // the image is negligible.
+  _coverageImage(showCovered) {
+    const cov = this._cov;
+    const key = `${showCovered}`;
+    if (this._covImage?.key === key) return this._covImage;
+    const cv = document.createElement('canvas');
+    cv.width = cov.cols; cv.height = cov.rows;
+    const ctx = cv.getContext('2d');
+    const img = ctx.createImageData(cov.cols, cov.rows);
+    cov.cells.forEach(cl => {
+      if (cl.cls === 'covered' && !showCovered) return;
+      const [r, g, b, a] = NET_CELL[cl.cls].rgba;
+      const o = ((cov.rows - 1 - cl.r) * cov.cols + cl.c) * 4;
+      img.data[o] = r; img.data[o + 1] = g; img.data[o + 2] = b; img.data[o + 3] = cl.measured && cl.cls !== cl.predicted ? Math.min(255, a + 60) : a;
+    });
+    ctx.putImageData(img, 0, 0);
+    this._covImage = { key, url: cv.toDataURL() };
+    return this._covImage;
+  }
+
+  _cellAt(latlng) {
+    const cov = this._cov;
+    if (!cov?.cells.length) return null;
+    const [[s, w], [n, e]] = [cov.cells[0].bounds[0], cov.cells[cov.cells.length - 1].bounds[1]];
+    if (latlng.lat < s || latlng.lat >= n || latlng.lng < w || latlng.lng >= e) return null;
+    const r = Math.floor((latlng.lat - s) / (n - s) * cov.rows), c = Math.floor((latlng.lng - w) / (e - w) * cov.cols);
+    return cov.cells[r * cov.cols + c] || null;
+  }
+
+  _showCellInfo(latlng) {
+    const el = $(this._infoCtl.getContainer());
+    const cl = $('#net-l-grid').prop('checked') ? this._cellAt(latlng) : null;
+    if (!cl) { el.addClass('d-none'); return; }
+    const m = cl.measured;
+    const measured = m ? `<div>Measured: ${m.devices.length} device(s) – ${['good', 'single', 'weak', 'silent'].filter(k => m.counts[k]).map(k => `${m.counts[k]} ${NET_STATUS[k].label.toLowerCase()}`).join(', ') || 'no gateway data'}</div>` : '<div class="text-muted">No devices in this cell – estimate only</div>';
+    el.removeClass('d-none').html(`<strong style="color:${NET_CELL[cl.cls].color}">${esc(NET_CELL[cl.cls].label)}</strong>${cl.region ? ` · area ${esc(cl.region)}` : ''}
+      <div>Predicted best: ${fmtNum(cl.best, 0)} dBm${cl.bestGw ? ` (${esc(netGwLabel(cl.bestGw))})` : ''}${Number.isFinite(cl.second) ? ` · 2nd ${fmtNum(cl.second, 0)} dBm` : ''}</div>
+      <div>Nearest gateway: ${fmtDistance(cl.nearestGw)}</div>${measured}`);
   }
 
   // ---------- filtering ----------
@@ -299,7 +433,8 @@ class NetworkView {
   _renderLegend() {
     const dev = Object.values(NET_STATUS).map(s => `<span><span class="net-dot" style="--c:${s.color}"></span>${esc(s.label)}</span>`).join('');
     $('#net-legend').html(`${dev}<span class="ms-2"><span class="net-gw-legend"><i class="bi bi-broadcast-pin"></i></span>Gateway</span>
-      <span class="ms-2">Links: <span class="net-line" style="--c:${NET_LINK_COLOR.good}"></span>good <span class="net-line" style="--c:${NET_LINK_COLOR.ok}"></span>fair <span class="net-line" style="--c:${NET_LINK_COLOR.weak}"></span>weak</span>`);
+      <span class="ms-2">Links: <span class="net-line" style="--c:${NET_LINK_COLOR.good}"></span>good <span class="net-line" style="--c:${NET_LINK_COLOR.ok}"></span>fair <span class="net-line" style="--c:${NET_LINK_COLOR.weak}"></span>weak</span>
+      <span class="ms-2">Reception: ${Object.values(NET_CELL).map(c => `<span class="net-sq" style="--c:${c.color}"></span>${esc(c.label)}`).join(' ')}</span>`);
   }
 
   _renderTiles() {
@@ -316,10 +451,11 @@ class NetworkView {
       tile('Weak', `${c.weak}${pct(c.weak)}`, NET_STATUS.weak.color),
       tile('Silent', `${c.silent}${pct(c.silent)}`, NET_STATUS.silent.color, 'No uplink in the time window'),
       c.unknown ? tile('No gateway data', `${c.unknown}${pct(c.unknown)}`, NET_STATUS.unknown.color) : '',
+      this._cov?.cells.length ? tile('No reception (est.)', `${fmtNum(this._cov.counts.none * this._cov.cellMeters ** 2 / 1e6, 1)} km²<small class="text-muted fs-6 fw-normal"> · ${Math.round(this._cov.counts.none / this._cov.cells.length * 100)}%</small>`, NET_CELL.none.color, 'Share of the analysed area where no reception is expected or observed') : '',
     ].join(''));
     $('#net-summary-badge').text(`${s.devices} devices · ${s.gateways} gateways`);
     const warns = [...(this._warnings || [])];
-    if (s.noGwInfo) warns.push('None of the loaded packets contained gateway statistics. This depends on the driver: Element LNS, Actility and proxy drivers attach them to LoRaWAN uplinks; other drivers (e.g. wM-Bus, NB-IoT) do not.');
+    if (s.noGwInfo) warns.push('None of the loaded packets contained gateway statistics. ELEMENT LNS attaches them to LoRaWAN uplinks – if you see this for LNS devices, please report it (the packet format may have changed).');
     const noLoc = s.devices - s.located;
     if (noLoc) warns.push(`${noLoc} device(s) have no location and are not shown on the map.`);
     const gwNoLoc = this._result.gateways.filter(g => !g.latlng && g.packets).length;
@@ -327,7 +463,10 @@ class NetworkView {
     $('#net-warning').toggleClass('d-none', !warns.length).html(warns.map(w => `<div><i class="bi bi-exclamation-triangle me-1"></i>${w}</div>`).join(''));
     $('#net-tab-dev-count').text(this._vis.devices.length);
     $('#net-tab-gw-count').text(this._vis.gateways.length);
-    $('#net-tab-hole-count').text(this._grid.filter(c => c.rating === 'hole').length);
+    $('#net-tab-hole-count').text(this._cov ? this._cov.regions.length : 0);
+    if (this._cov?.cellMeters && this._cov.cellMeters !== this._cov.requestedCellMeters) {
+      $('#net-warning').removeClass('d-none').append(`<div><i class="bi bi-info-circle me-1"></i>Reception map uses ${fmtDistance(this._cov.cellMeters)} cells (area too large for ${fmtDistance(this._cov.requestedCellMeters)}).</div>`);
+    }
   }
 
   _gwIcon(gw, selected) {
@@ -346,12 +485,16 @@ class NetworkView {
     const { devices, gateways } = this._vis;
     const sel = this._selection;
 
-    if ($('#net-l-grid').prop('checked')) {
-      this._grid.forEach(c => {
-        L.rectangle(c.bounds, { renderer: this._renderer, color: NET_CELL_COLOR[c.rating], weight: 1, fillOpacity: c.rating === 'good' ? 0.15 : 0.35 })
-          .bindTooltip(`<strong>${esc(c.rating)}</strong><br>${c.devices.length} device(s): ${c.counts.good} good, ${c.counts.single} single, ${c.counts.weak} weak, ${c.counts.silent} silent<br>Nearest gateway: ${fmtDistance(c.nearestGwDistance)}`)
-          .addTo(L_.grid);
-      });
+    if ($('#net-l-grid').prop('checked') && this._cov?.cells.length) {
+      const im = this._coverageImage($('#net-l-covered').prop('checked'));
+      const b = [this._cov.cells[0].bounds[0], this._cov.cells[this._cov.cells.length - 1].bounds[1]];
+      L.imageOverlay(im.url, b, { className: 'net-cov-img', interactive: false, opacity: 1 }).addTo(L_.grid);
+      L.rectangle(b, { renderer: this._renderer, color: '#495057', weight: 1, dashArray: '6 4', fill: false, interactive: false }).addTo(L_.grid);
+    }
+    if (sel?.kind === 'area') {
+      const rg = this._areaById.get(sel.id);
+      if (rg) rg.cells.forEach(cl => L.rectangle(cl.bounds, { renderer: this._renderer, color: '#c92a2a', weight: 0, fillColor: '#c92a2a', fillOpacity: 0.35, interactive: false }).addTo(L_.area));
+      if (rg) L.rectangle(rg.bounds, { renderer: this._renderer, color: '#c92a2a', weight: 2, fill: false, dashArray: '4 3', interactive: false }).addTo(L_.area);
     }
 
     if ($('#net-l-range').prop('checked')) {
@@ -425,6 +568,7 @@ class NetworkView {
   _resolveSelection() {
     const sel = this._selection;
     if (!sel || !this._result) return null;
+    if (sel.kind === 'area') return this._areaById?.get(sel.id) || null;
     return sel.kind === 'device' ? this._devById.get(sel.id) : this._gwByKey.get(sel.id);
   }
 
@@ -440,6 +584,7 @@ class NetworkView {
   _zoomSelection() {
     const r = this._resolveSelection();
     if (!r || !this._map) return;
+    if (this._selection.kind === 'area') { this._map.fitBounds(r.bounds, { padding: [60, 60], maxZoom: 17 }); return; }
     const pts = [];
     if (this._selection.kind === 'device') {
       if (r.latlng) pts.push(r.latlng);
@@ -461,6 +606,7 @@ class NetworkView {
       return;
     }
     if (this._selection.kind === 'device') this._renderDeviceSelection(r);
+    else if (this._selection.kind === 'area') this._renderAreaSelection(r);
     else this._renderGatewaySelection(r);
   }
 
@@ -527,6 +673,30 @@ class NetworkView {
         : '<p class="text-muted mb-0">No devices in scope were received by this gateway.</p>'}`);
   }
 
+  _renderAreaSelection(rg) {
+    $('#net-sel-title').html(`<i class="bi bi-slash-circle me-1"></i>No-reception area ${esc(rg.id)}`);
+    const affected = rg.affected.slice(0, 200).map(st => `<tr><td><a href="#" data-select-kind="device" data-select-id="${esc(st.id)}">${esc(st.name)}</a></td><td>${netStatusBadge(st.status)}</td><td class="text-end">${fmtNum(st.best?.rssiAvg, 0)}</td></tr>`).join('');
+    const basis = rg.measuredOnly ? 'measured only (model predicts reception)' : (rg.devicesInside ? 'model + device evidence' : 'model estimate (no devices here)');
+    $('#net-sel-body').html(`
+      <dl class="row mb-2 net-dl">
+        <dt class="col-6">Size</dt><dd class="col-6">${fmtNum(rg.areaKm2, 2)} km² <small class="text-muted">(${rg.size} cells)</small></dd>
+        <dt class="col-6">Basis</dt><dd class="col-6">${esc(basis)}</dd>
+        <dt class="col-6">Devices inside</dt><dd class="col-6">${rg.devicesInside}${rg.affected.length ? ` <small class="text-danger">(${rg.affected.length} silent/weak)</small>` : ''}</dd>
+        <dt class="col-6">Best predicted RSSI</dt><dd class="col-6">${fmtNum(rg.bestPredicted, 0)} dBm</dd>
+        <dt class="col-6">Nearest active gateway</dt><dd class="col-6">${fmtDistance(rg.nearestGw)}</dd>
+        <dt class="col-6">Location</dt><dd class="col-6"><code class="small">${rg.point[0].toFixed(5)}, ${rg.point[1].toFixed(5)}</code></dd>
+        ${rg.edge ? '<dt class="col-12 fw-normal text-muted">Extends to the border of the analysed area – enlarge the area to see its full extent.</dt>' : ''}
+      </dl>
+      <button type="button" class="btn btn-sm btn-outline-secondary mb-2 net-zoom-area" data-id="${esc(rg.id)}"><i class="bi bi-zoom-in me-1"></i>Zoom</button>
+      ${rg.measuredOnly ? '<p class="text-muted">Only device evidence marks this area: devices here are silent or weak although the model expects reception. Check the devices (battery, installation depth, antenna) before planning a gateway.</p>' : ''}
+      ${affected ? `<div class="table-responsive"><table class="table table-sm mb-0"><thead><tr><th>Affected device</th><th>Status</th><th class="text-end">RSSI</th></tr></thead><tbody>${affected}</tbody></table></div>` : ''}`);
+  }
+
+  _zoomArea(id) {
+    const rg = this._areaById?.get(id);
+    if (rg && this._map) this._map.fitBounds(rg.bounds, { padding: [60, 60], maxZoom: 17 });
+  }
+
   _openDevice(id) {
     const st = this._devById.get(id);
     const dev = st?.device || this._raw?.gatewayDevices.find(g => g.id === id);
@@ -564,22 +734,21 @@ class NetworkView {
       { key: 'last', label: 'Last packet', val: g => g.lastSeen || '', html: g => (g.lastSeen ? fmtAgo(g.lastSeen) : '—') },
     ];
     return [
-      { key: 'rating', label: 'Rating', val: c => ratingOrder[c.rating] * 10 - c.badShare, html: c => `<span class="badge net-badge" style="--c:${NET_CELL_COLOR[c.rating]}">${esc(c.rating)}</span>` },
-      { key: 'devices', label: 'Devices', num: true, val: c => c.devices.length, html: c => c.devices.length },
-      { key: 'silent', label: 'Silent', num: true, val: c => c.counts.silent, html: c => c.counts.silent },
-      { key: 'weak', label: 'Weak', num: true, val: c => c.counts.weak, html: c => c.counts.weak },
-      { key: 'single', label: 'Single GW', num: true, val: c => c.counts.single, html: c => c.counts.single },
-      { key: 'good', label: 'Good', num: true, val: c => c.counts.good, html: c => c.counts.good },
-      { key: 'near', label: 'Nearest GW', num: true, val: c => c.nearestGwDistance ?? 1e12, html: c => fmtDistance(c.nearestGwDistance) },
-      { key: 'where', label: 'Location', val: c => c.center[0], html: c => `<code class="small">${c.center[0].toFixed(5)}, ${c.center[1].toFixed(5)}</code>` },
-      { key: 'sample', label: 'Devices', val: () => 0, html: c => esc(c.devices.slice(0, 3).map(d => d.name).join(', ') + (c.devices.length > 3 ? ` +${c.devices.length - 3}` : '')) },
+      { key: 'id', label: 'Area', val: r => parseInt(r.id.slice(1), 10), html: r => `<strong>${esc(r.id)}</strong>` },
+      { key: 'area', label: 'Size (km²)', num: true, val: r => r.areaKm2, html: r => fmtNum(r.areaKm2, 2) },
+      { key: 'basis', label: 'Basis', val: r => (r.measuredOnly ? 2 : r.devicesInside ? 1 : 0), html: r => (r.measuredOnly ? '<span class="badge text-bg-warning" title="Devices are silent/weak although the model predicts reception">measured</span>' : r.devicesInside ? '<span class="badge text-bg-danger">model + devices</span>' : '<span class="badge text-bg-secondary">estimate</span>') },
+      { key: 'devices', label: 'Devices inside', num: true, val: r => r.devicesInside, html: r => r.devicesInside },
+      { key: 'affected', label: 'Silent/weak', num: true, val: r => r.affected.length, html: r => (r.affected.length ? `<strong class="text-danger">${r.affected.length}</strong>` : 0) },
+      { key: 'best', label: 'Best pred. RSSI', num: true, val: r => r.bestPredicted, html: r => fmtNum(r.bestPredicted, 0) },
+      { key: 'near', label: 'Nearest GW', num: true, val: r => r.nearestGw, html: r => fmtDistance(r.nearestGw) },
+      { key: 'where', label: 'Location', val: r => r.point[0], html: r => `<code class="small">${r.point[0].toFixed(5)}, ${r.point[1].toFixed(5)}</code>${r.edge ? ' <i class="bi bi-box-arrow-up-right text-muted" title="Extends to the border of the analysed area"></i>' : ''}` },
     ];
   }
 
   _rowsForTab() {
     if (this._tab === 'devices') return this._vis.devices;
     if (this._tab === 'gateways') return this._vis.gateways;
-    return this._grid.filter(c => c.rating !== 'good');
+    return this._cov ? this._cov.regions : [];
   }
 
   _renderTable() {
@@ -591,23 +760,19 @@ class NetworkView {
       return (va < vb ? -1 : va > vb ? 1 : 0) * s.dir;
     });
     $('#net-thead').html(`<tr>${cols.map(c => `<th data-col="${c.key}" class="sortable${c.num ? ' text-end' : ''}">${esc(c.label)}${c.key === col.key ? ` <i class="bi bi-arrow-${s.dir > 0 ? 'up' : 'down'} small text-primary"></i>` : ''}</th>`).join('')}</tr>`);
-    const kind = { devices: 'device', gateways: 'gw', holes: 'cell' }[this._tab];
-    const idOf = r => (kind === 'device' ? r.id : r.key);
+    const kind = { devices: 'device', gateways: 'gw', holes: 'area' }[this._tab];
+    const idOf = r => (kind === 'gw' ? r.key : r.id);
     const selId = this._selection?.id;
     $('#net-tbody').html(rows.slice(0, NET_MAX_TABLE_ROWS).map(r =>
       `<tr data-kind="${kind}" data-id="${esc(idOf(r))}" class="${idOf(r) === selId ? 'table-active' : ''}">${cols.map(c => `<td class="${c.num ? 'text-end' : ''}">${c.html(r)}</td>`).join('')}</tr>`).join('') ||
-      `<tr><td colspan="${cols.length}" class="text-center text-muted py-3">${this._tab === 'holes' ? 'No coverage problems found among located devices.' : 'Nothing matches the current filters.'}</td></tr>`);
-    const foot = this._tab === 'holes'
-      ? `Cells of ${$('#net-grid-size option:selected').text()} containing silent, weak or single-gateway devices. <strong>hole</strong> = every rated device in the cell is silent or weak. Cells without devices are not rated.`
-      : (rows.length > NET_MAX_TABLE_ROWS ? `Showing ${NET_MAX_TABLE_ROWS} of ${rows.length} rows – use the filters or export CSV.` : `${rows.length} row(s)`);
+      `<tr><td colspan="${cols.length}" class="text-center text-muted py-3">${this._tab === 'holes' ? (this._cov?.gateways ? 'No area without reception found in the analysed area.' : 'Needs at least one located, receiving gateway.') : 'Nothing matches the current filters.'}</td></tr>`);
+    let foot;
+    if (this._tab === 'holes' && this._cov) {
+      const g = this._cov.model.global;
+      const fit = g.fitted === 'full' ? `fitted from ${g.samples} links` : (g.fitted === 'intercept' ? `level fitted from ${g.samples} links, exponent assumed` : 'default model – too few located links');
+      foot = `Contiguous cells without reception (${fmtDistance(this._cov.cellMeters)} grid). Path-loss model: RSSI@1 km ${fmtNum(g.r1k, 0)} dBm, n = ${fmtNum(g.n)} (${fit}${g.residual != null ? `, scatter ±${fmtNum(g.residual)} dB` : ''}). Click a row to show the area.`;
+    } else foot = rows.length > NET_MAX_TABLE_ROWS ? `Showing ${NET_MAX_TABLE_ROWS} of ${rows.length} rows – use the filters or export CSV.` : `${rows.length} row(s)`;
     $('#net-table-foot').html(foot);
-  }
-
-  _zoomCell(key) {
-    const c = this._grid.find(x => x.key === key);
-    if (!c || !this._map) return;
-    if (!$('#net-l-grid').prop('checked')) { $('#net-l-grid').prop('checked', true); this._renderMap(); }
-    this._map.fitBounds(c.bounds, { padding: [60, 60], maxZoom: 17 });
   }
 
   // ---------- export ----------
@@ -637,10 +802,19 @@ class NetworkView {
     downloadFile(`elmo-network-gateways-${this._fileStamp()}.csv`, toCsv(rows), 'text/csv');
   }
 
+  _exportAreas() {
+    if (!this._cov) return;
+    const rows = [['area', 'size_km2', 'cells', 'basis', 'devices_inside', 'silent_or_weak', 'best_predicted_rssi', 'nearest_gateway_m', 'lat', 'lng', 'south', 'west', 'north', 'east', 'extends_to_border', 'affected_devices']];
+    this._cov.regions.forEach(r => rows.push([r.id, r.areaKm2.toFixed(3), r.size, r.measuredOnly ? 'measured' : (r.devicesInside ? 'model+devices' : 'estimate'), r.devicesInside, r.affected.length,
+      r.bestPredicted.toFixed(1), r.nearestGw.toFixed(0), r.point[0].toFixed(6), r.point[1].toFixed(6), r.bounds[0][0].toFixed(6), r.bounds[0][1].toFixed(6), r.bounds[1][0].toFixed(6), r.bounds[1][1].toFixed(6), r.edge, r.affected.map(d => d.name).join('; ')]));
+    downloadFile(`elmo-no-reception-areas-${this._fileStamp()}.csv`, toCsv(rows), 'text/csv');
+  }
+
   _exportCells() {
-    if (!this._result) return;
-    const rows = [['rating', 'center_lat', 'center_lng', 'devices', 'good', 'single', 'weak', 'silent', 'no_gateway_data', 'nearest_gateway_m', 'device_names']];
-    this._grid.forEach(c => rows.push([c.rating, c.center[0].toFixed(6), c.center[1].toFixed(6), c.devices.length, c.counts.good, c.counts.single, c.counts.weak, c.counts.silent, c.counts.unknown, c.nearestGwDistance?.toFixed(0), c.devices.map(d => d.name).join('; ')]));
-    downloadFile(`elmo-network-coverage-${this._fileStamp()}.csv`, toCsv(rows), 'text/csv');
+    if (!this._cov) return;
+    const rows = [['lat', 'lng', 'class', 'predicted_class', 'best_predicted_rssi', 'second_predicted_rssi', 'best_gateway', 'nearest_gateway_m', 'devices', 'area']];
+    this._cov.cells.forEach(c => rows.push([c.center[0].toFixed(6), c.center[1].toFixed(6), c.cls, c.predicted, c.best.toFixed(1), Number.isFinite(c.second) ? c.second.toFixed(1) : '',
+      c.bestGw ? netGwLabel(c.bestGw) : '', c.nearestGw.toFixed(0), c.measured ? c.measured.devices.length : 0, c.region || '']));
+    downloadFile(`elmo-reception-grid-${this._fileStamp()}.csv`, toCsv(rows), 'text/csv');
   }
 }

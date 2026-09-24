@@ -92,3 +92,8 @@ th.sortable:hover { background: #e9ecef !important; }
 .net-gw-icon.selected { outline: 3px solid #fab005; transform: scale(1.2); }
 .net-gw-legend { display: inline-flex; width: 16px; height: 16px; border-radius: 4px; background: #1c7ed6; color: #fff; font-size: 10px; align-items: center; justify-content: center; margin-right: 4px; vertical-align: -3px; }
 .leaflet-container { font: inherit; }
+.net-sq { display: inline-block; width: 10px; height: 10px; background: var(--c); opacity: .7; margin: 0 3px 0 6px; vertical-align: -1px; }
+.net-cov-img { image-rendering: pixelated; image-rendering: crisp-edges; }
+#net-map.net-no-tiles { background: #f1f3f5 repeating-linear-gradient(0deg, transparent 0 49px, rgba(0,0,0,.035) 49px 50px), repeating-linear-gradient(90deg, transparent 0 49px, rgba(0,0,0,.035) 49px 50px); }
+.net-tile-ctl { background: #fff; }
+.net-cell-info { background: rgba(255,255,255,.95); padding: .35rem .55rem; border-radius: .375rem; box-shadow: 0 1px 4px rgba(0,0,0,.25); font-size: .78rem; max-width: 320px; pointer-events: none; }

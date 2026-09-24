@@ -20,6 +20,7 @@ class ConfigView {
       if (settings?.tileUrl !== undefined) $('#cfg-tile-url').val(settings.tileUrl);
       else $('#cfg-tile-url').val(NET_DEFAULT_TILES.url);
       $('#cfg-tile-attr').val(settings?.tileAttribution ?? NET_DEFAULT_TILES.attribution);
+      $('#cfg-tiles-enabled').prop('checked', settings?.externalTiles === true);
     } catch {}
   }
   _bind() {
@@ -49,7 +50,7 @@ class ConfigView {
     if (tileUrl && !/^https:\/\/.+\{z\}.*\{x\}.*\{y\}/.test(tileUrl)) { this._toast.show('Tile URL must use https:// and contain {z}, {x} and {y}', 'warning'); return; }
     window._app._apiLogger.setMaxEntries(maxEntries);
     window._app._devV.setMaxDevices(maxDevices);
-    localStorage.setItem('deviceAdminSettings', JSON.stringify({ maxLogEntries: maxEntries, maxDevices: maxDevices, tileUrl, tileAttribution: $('#cfg-tile-attr').val().trim() }));
+    localStorage.setItem('deviceAdminSettings', JSON.stringify({ maxLogEntries: maxEntries, maxDevices: maxDevices, tileUrl, tileAttribution: $('#cfg-tile-attr').val().trim(), externalTiles: $('#cfg-tiles-enabled').prop('checked') }));
     window._app._netV.applyTileSettings();
     this._toast.show('Configuration and settings saved', 'success');
     window._app._init();

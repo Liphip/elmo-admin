@@ -128,14 +128,16 @@
 
       <h4>Kartendarstellung (Ansicht „Network“)</h4>
       <p>
-        Nur beim Öffnen der Ansicht „Network“ lädt der Browser Kartenkacheln
-        standardmäßig von OpenStreetMap (OpenStreetMap Foundation, St John’s
-        Innovation Centre, Cowley Road, Cambridge, CB4 0WS, Vereinigtes Königreich).
-        Dabei wird technisch bedingt die IP-Adresse des Nutzers an den Kachelserver
-        übermittelt. Geräte- oder Messdaten werden nicht übertragen – angefragt
-        werden ausschließlich Kartenausschnitte. Der Kachelserver kann in der
-        Konfiguration geändert oder durch ein leeres Feld vollständig deaktiviert
-        werden. Weitere Informationen:
+        Standardmäßig werden <strong>keine externen Anfragen</strong> gestellt; die
+        Karte zeigt Gateways, Geräte und die Empfangsabschätzung ohne Hintergrundkarte.
+        Erst wenn der Nutzer die Hintergrundkarte ausdrücklich aktiviert (Schaltfläche
+        „Load base map“ für die aktuelle Sitzung oder dauerhaft in der Konfiguration),
+        lädt der Browser Kartenkacheln vom eingestellten Kachelserver, standardmäßig
+        OpenStreetMap (OpenStreetMap Foundation, St John’s Innovation Centre, Cowley
+        Road, Cambridge, CB4 0WS, Vereinigtes Königreich). Dabei wird technisch bedingt
+        die IP-Adresse des Nutzers an den Kachelserver übermittelt. Geräte- oder
+        Messdaten werden nicht übertragen – angefragt werden ausschließlich
+        Kartenausschnitte. Weitere Informationen:
         <a href="https://osmfoundation.org/wiki/Privacy_Policy"
            rel="noopener noreferrer" target="_blank">Datenschutzerklärung der OpenStreetMap Foundation</a>.
       </p>
