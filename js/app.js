@@ -53,7 +53,13 @@ class App {
   _bindNav() {
     if (location.protocol === 'file:') $('#cors-hint').removeClass('d-none');
     $('#sidebar .nav-link[data-view]').on('click', e => { e.preventDefault(); this.navigateTo($(e.currentTarget).data('view')); });
-    $('#sidebar-toggle').on('click', () => $('#sidebar').toggleClass('collapsed'));
+    $('#sidebar-toggle').on('click', () => {
+      $('#sidebar').toggleClass('collapsed');
+      try { localStorage.setItem('elmoSidebarCollapsed', $('#sidebar').hasClass('collapsed') ? '1' : ''); } catch {}
+      setTimeout(() => this._netV._map?.invalidateSize(), 250);
+    });
+    try { if (localStorage.getItem('elmoSidebarCollapsed')) $('#sidebar').addClass('collapsed'); } catch {}
+    this._initTheme();
     document.addEventListener('keydown', e => {
       if (e.key === 'Escape') { const oc = bootstrap.Offcanvas.getInstance(document.getElementById('device-detail-offcanvas')); if (oc) oc.hide(); }
       if ((e.ctrlKey||e.metaKey) && e.key === 'f' && $('#view-devices').hasClass('active')) { e.preventDefault(); document.getElementById('dev-filter-name').focus(); }
@@ -75,6 +81,26 @@ class App {
     });
     $('#api-log-search-btn').on('click', () => this._renderApiLog($('#api-log-search').val()));
     $('#api-log-search').on('keydown', e => { if (e.key === 'Enter') this._renderApiLog($('#api-log-search').val()); });
+  }
+
+  _initTheme() {
+    const order = ['auto', 'light', 'dark'];
+    const media = window.matchMedia ? matchMedia('(prefers-color-scheme: dark)') : null;
+    let mode = 'auto';
+    try { mode = localStorage.getItem('elmoTheme') || 'auto'; } catch {}
+    const apply = () => {
+      const dark = mode === 'dark' || (mode === 'auto' && media?.matches);
+      document.documentElement.setAttribute('data-bs-theme', dark ? 'dark' : 'light');
+      $('#theme-label').text(`Theme: ${mode}`);
+      $('#theme-toggle i').attr('class', `bi ${mode === 'auto' ? 'bi-circle-half' : dark ? 'bi-moon-stars-fill' : 'bi-sun-fill'} sidebar-nav-icon`);
+    };
+    media?.addEventListener?.('change', () => { if (mode === 'auto') apply(); });
+    $('#theme-toggle').on('click', () => {
+      mode = order[(order.indexOf(mode) + 1) % order.length];
+      try { localStorage.setItem('elmoTheme', mode); } catch {}
+      apply();
+    });
+    apply();
   }
 
   _renderApiLog(query = '') {

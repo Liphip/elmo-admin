@@ -32,6 +32,8 @@ const NET_GW_ID_FILTERS = [
   ids => ids.map(id => `interfaces[0].opts.gateway_id == "${id}"`).join(' || '),
 ];
 const NET_SCOPE_KEY = 'elmoNetworkScope';
+const NET_CACHE_MS = 15 * 60e3;          // reuse loaded packets / device lists for 15 minutes
+const NET_STREAM_MIN_DEVICES = 10;       // a folder stream is only worth it for this many devices
 const NET_MAX_TABLE_ROWS = 1000;
 const NET_MAX_LINKS = 5000;
 
@@ -65,6 +67,9 @@ class NetworkView {
       gwFolders: new MultiSelect('#net-gw-folders', { placeholder: 'All folders' }),
     };
     this._scopeRestored = false;
+    this._pktCache = new Map();
+    this._gwMiss = new Map();       // gateway EUI -> time of an unsuccessful lookup
+    this._instCache = null;         // { at, list } driver instances
     this._selection = null;
     this._tab = 'devices';
     this._sort = { devices: { col: 'status', dir: 1 }, gateways: { col: 'devices', dir: -1 }, holes: { col: 'area', dir: -1 } };
@@ -161,7 +166,7 @@ class NetworkView {
     try {
       localStorage.setItem(NET_SCOPE_KEY, JSON.stringify({
         dev: this._scope('dev'), gw: this._scope('gw'), mode: $('#net-mode').val(), window: $('#net-scope-window').val(),
-        lns: $('#net-scope-lns').prop('checked'), lookup: $('#net-gw-lookup').prop('checked'),
+        lns: $('#net-scope-lns').prop('checked'), lookup: $('#net-gw-lookup').prop('checked'), strategy: $('#net-pk-strategy').val(),
       }));
     } catch { /* storage unavailable */ }
   }
@@ -179,13 +184,14 @@ class NetworkView {
       if (s.window) $('#net-scope-window').val(s.window);
       if (typeof s.lns === 'boolean') $('#net-scope-lns').prop('checked', s.lns);
       if (typeof s.lookup === 'boolean') $('#net-gw-lookup').prop('checked', s.lookup);
+      if (s.strategy) $('#net-pk-strategy').val(s.strategy);
       this._syncMode();
     } catch { /* ignore */ }
   }
 
   _syncMode() {
     const quick = $('#net-mode').val() === 'quick';
-    $('#net-scope-packets, #net-scope-uplinks, #net-gw-lookup').prop('disabled', quick);
+    $('#net-scope-packets, #net-scope-uplinks, #net-gw-lookup, #net-pk-strategy').prop('disabled', quick);
   }
 
   onShow() {
@@ -241,6 +247,7 @@ class NetworkView {
       grid: L.layerGroup().addTo(this._map),
       area: L.layerGroup().addTo(this._map),
       range: L.layerGroup().addTo(this._map),
+      linksAll: L.layerGroup().addTo(this._map),
       links: L.layerGroup().addTo(this._map),
       dev: L.layerGroup().addTo(this._map),
       gw: L.layerGroup().addTo(this._map),
@@ -308,6 +315,150 @@ class NetworkView {
     return true;
   }
 
+  // The Devices view's list can stand in for listing requests when it is complete and fresh.
+  _reusableDeviceList() {
+    const dv = window._app?._devV;
+    const st = this._state;
+    if (!dv || !st.isLoaded.devices || dv._hasMore || !st.devices.length) return null;
+    if (!st.devicesLoadedAt || Date.now() - st.devicesLoadedAt > NET_CACHE_MS) return null;
+    return st.devices;
+  }
+
+  _cachedPackets(d, { afterMs, perDevice, uplinks }) {
+    const e = this._pktCache.get(d.id);
+    if (!e || Date.now() - e.at > NET_CACHE_MS || e.uplinks !== uplinks) return null;
+    const list = e.packets.filter(p => (NetAnalysis.tsMs(p.transceived_at) ?? 0) >= afterMs);
+    // Stream result that was judged sufficient for an analysis window at least as long.
+    if (e.sufficientFor != null && e.sufficientFor <= afterMs && e.perDevice >= perDevice) return list.slice(0, perDevice);
+    // Truncated entry (newest `limit` packets): usable whenever it still holds perDevice packets
+    // inside the window. Complete entry (all packets since e.afterMs): usable if it covers the window.
+    if (e.packets.length >= e.limit) return list.length >= perDevice ? list.slice(0, perDevice) : null;
+    return e.afterMs <= afterMs ? list.slice(0, perDevice) : null;
+  }
+
+  _storePackets(id, packets, { afterMs, limit, uplinks }) {
+    const sorted = packets.sort((a, b) => (NetAnalysis.tsMs(b.transceived_at) ?? 0) - (NetAnalysis.tsMs(a.transceived_at) ?? 0));
+    this._pktCache.set(id, { at: Date.now(), afterMs, limit, uplinks, packets: sorted });
+    return sorted;
+  }
+
+  // Plans folder streams: picks a stream window from ELEMENT's per-device packet intervals so
+  // that most devices deliver a few uplinks, capped so the transfer stays about as large as
+  // per-device loading, and a small set of folders covering the devices (greedy set cover).
+  _planStreams(todo, devScope, afterMs, perDevice) {
+    const now = Date.now(), fullSecs = (now - afterMs) / 1000;
+    const k = Math.min(perDevice, 5);
+    const iv = d => NetAnalysis.packetIntervalSecs(d);
+    const needed = todo.map(d => (iv(d) ? Math.min(k * iv(d), fullSecs) : fullSecs)).sort((a, b) => a - b);
+    let W = Math.min(fullSecs, Math.max(3600, needed[Math.floor(needed.length * 0.8)] || fullSecs));
+    const est = w => todo.reduce((sum, d) => sum + (iv(d) ? Math.min(w / iv(d), 5000) : Math.min(w / 3600, 500)), 0);
+    const budget = Math.max(todo.length * perDevice, 20000);
+    let e = est(W);
+    if (e > budget) { W = Math.max(3600, W * budget / e); e = est(W); }
+
+    let folders;
+    if (devScope.folders.length) folders = devScope.folders.slice();
+    else {
+      const byFolder = new Map();
+      todo.forEach(d => (d.tags || []).forEach(t => { if (!byFolder.has(t.id)) byFolder.set(t.id, new Set()); byFolder.get(t.id).add(d.id); }));
+      const covered = new Set();
+      folders = [];
+      while (folders.length < 60) {
+        let bestId = null, bestN = 0;
+        byFolder.forEach((ids, id) => { let n = 0; ids.forEach(x => { if (!covered.has(x)) n++; }); if (n > bestN) { bestN = n; bestId = id; } });
+        if (!bestId || bestN < NET_STREAM_MIN_DEVICES) break;
+        folders.push(bestId);
+        byFolder.get(bestId).forEach(x => covered.add(x));
+        byFolder.delete(bestId);
+      }
+    }
+    return { afterMs: now - W * 1000, windowSecs: W, folders, estPackets: Math.round(e), budget };
+  }
+
+  async _loadPackets(todo, { after, afterMs, perDevice, uplinks, strategy, useCache, devScope, statsSilent, warnings }) {
+    const out = new Map();
+    const opts = { afterMs, perDevice, uplinks };
+    const skipped = statsSilent ? ` · ${statsSilent} skipped (no uplink in window per ELEMENT statistics)` : '';
+    let pending = todo;
+    if (useCache) {
+      pending = todo.filter(d => { const c = this._cachedPackets(d, opts); if (c) out.set(d.id, c); return !c; });
+    }
+    const fromCache = todo.length - pending.length;
+
+    // a) Folder streams: one request per folder instead of one per device
+    let streamed = 0;
+    if (strategy === 'auto' && pending.length >= NET_STREAM_MIN_DEVICES && !this._cancel) {
+      const plan = this._planStreams(pending, devScope, afterMs, perDevice);
+      const want = new Set(pending.map(d => d.id));
+      const got = new Map();
+      let items = 0, overhead = 0;
+      const maxItems = plan.budget * 3;
+      for (let fi = 0; fi < plan.folders.length && !this._cancel; fi++) {
+        const fid = plan.folders[fi];
+        const params = { after: new Date(plan.afterMs).toISOString() };
+        if (uplinks) params.packet_type = 'up';
+        try {
+          await this._api.stream(`/tags/${encodeURIComponent(fid)}/packets/stream`, params, p => {
+            items++;
+            if (want.has(p.device_id)) {
+              if (!got.has(p.device_id)) got.set(p.device_id, []);
+              got.get(p.device_id).push(NetAnalysis.compactPacket(p));
+            } else overhead++;
+            if (items % 2000 === 0) this._progress(`<span class="spinner-border spinner-border-sm me-1"></span>Streaming folder packets ${fi + 1} / ${plan.folders.length}… ${items.toLocaleString()} packets${skipped}`);
+            return items < maxItems;
+          }, { shouldStop: () => this._cancel });
+        } catch (e) {
+          warnings.push(`Folder packet streaming failed (${esc(e.message)}) – falling back to per-device requests.`);
+          break;
+        }
+        if (items >= maxItems) { warnings.push(`Folder streams were stopped after ${items.toLocaleString()} packets (transfer limit); remaining devices are loaded per device.`); break; }
+      }
+      const streamAfterMs = plan.afterMs;
+      got.forEach((list, id) => {
+        // Only the newest perDevice packets since the stream start are kept.
+        const sorted = this._storePackets(id, list, { afterMs: streamAfterMs, limit: Infinity, uplinks }).slice(0, perDevice);
+        this._pktCache.get(id).packets = sorted;
+        this._pktCache.get(id).limit = list.length > perDevice ? perDevice : Infinity;
+        out.set(id, sorted);
+      });
+      streamed = got.size;
+      // Devices that need a per-device request: fewer packets than they should have in the
+      // full window (they send rarely, or were outside the streamed folders).
+      const fullSecs = (Date.now() - afterMs) / 1000, minPk = Math.min(3, perDevice);
+      pending = pending.filter(d => {
+        const n = got.get(d.id)?.length || 0;
+        const ivs = NetAnalysis.packetIntervalSecs(d);
+        const expected = ivs ? Math.floor(fullSecs / ivs) : Infinity;
+        const short = n < Math.min(minPk, Math.max(expected, 1));
+        if (!short && this._pktCache.has(d.id)) Object.assign(this._pktCache.get(d.id), { sufficientFor: afterMs, perDevice });
+        return short;
+      });
+      this._streamInfo = { folders: plan.folders.length, windowSecs: plan.windowSecs, items, overhead, devices: streamed };
+    } else this._streamInfo = null;
+
+    // b) Per-device requests for the rest
+    let done = 0;
+    const started = Date.now();
+    const res = await runConcurrent(pending, async d => {
+      if (this._cancel) throw new Error('cancelled');
+      const params = { limit: perDevice, after, sort_direction: 'descending' };
+      if (uplinks) params.packet_type = 'up';
+      const r = await this._api.get(`/devices/${d.id}/packets`, params);
+      const list = (Array.isArray(r.body) ? r.body : []).map(NetAnalysis.compactPacket);
+      out.set(d.id, this._storePackets(d.id, list, { afterMs, limit: perDevice, uplinks }));
+      done++;
+      if (done % 5 === 0 || done === pending.length) {
+        const eta = done ? Math.round((Date.now() - started) / done * (pending.length - done) / 1000) : 0;
+        this._progress(`<span class="spinner-border spinner-border-sm me-1"></span>Loading packets per device… ${done} / ${pending.length}${streamed ? ` (${streamed} from folder streams)` : ''}${fromCache ? ` · ${fromCache} cached` : ''}${skipped}${eta > 5 ? ` · ~${eta}s left` : ''}`);
+      }
+    }, 4);
+    if (this._cancel) warnings.push(`Analysis was cancelled after ${done} of ${pending.length} per-device requests – the remaining devices are rated from ELEMENT statistics.`);
+    const failed = res.failed.filter(f => f.error !== 'cancelled');
+    if (failed.length) warnings.push(`Packets could not be loaded for ${failed.length} device(s) (e.g. ${esc(failed[0].item.name || failed[0].item.id)}: ${esc(failed[0].error)}). They are rated from ELEMENT statistics.`);
+    this._loadInfo = { fromCache, streamed, perDevice: done };
+    return out;
+  }
+
   async analyze() {
     if (this._busy) return;
     if (!this._api.apiKey) { this._toast.show('Configure API credentials first', 'warning'); return; }
@@ -319,6 +470,8 @@ class NetworkView {
     const uplinks = $('#net-scope-uplinks').prop('checked');
     const lnsOnly = $('#net-scope-lns').prop('checked');
     const lookup = !quick && $('#net-gw-lookup').prop('checked');
+    const strategy = $('#net-pk-strategy').val() || 'auto';
+    const useCache = $('#net-use-cache').prop('checked');
     const after = new Date(Date.now() - hours * 3600e3).toISOString();
     const afterMs = Date.parse(after);
     this._saveScope();
@@ -329,8 +482,11 @@ class NetworkView {
     const reqStart = this._api.requestCount || 0;
     const cancelled = () => { if (this._cancel) throw new Error('cancelled'); };
     try {
-      // 1. Devices in scope
-      const inDevScope = await this._loadScope(devScope, { purpose: 'dev', maxItems: maxDev, label: 'Loading devices…' });
+      // 1. Devices in scope – reuses the complete, fresh list of the Devices view when available
+      const reuse = useCache ? this._reusableDeviceList() : null;
+      const inDevScope = reuse
+        ? reuse.filter(d => this._inScope(d, devScope)).slice(0, maxDev)
+        : await this._loadScope(devScope, { purpose: 'dev', maxItems: maxDev, label: 'Loading devices…' });
       cancelled();
       if (inDevScope.length >= maxDev) warnings.push(`Device limit reached: only the first ${maxDev} devices were analysed. Narrow the device scope or raise "Max devices".`);
       let sensors = inDevScope.filter(d => !NetAnalysis.isGatewayDevice(d));
@@ -339,7 +495,9 @@ class NetworkView {
       this._skipped = 0;
       if (lnsOnly) {
         try {
-          const inst = await this._api.fetchAllPages('/drivers/instances', { limit: 100 }, null, { shouldStop: () => this._cancel });
+          const fresh = useCache && this._instCache && Date.now() - this._instCache.at < NET_CACHE_MS;
+          const inst = fresh ? this._instCache.list : await this._api.fetchAllPages('/drivers/instances', { limit: 100 }, null, { shouldStop: () => this._cancel });
+          this._instCache = { at: fresh ? this._instCache.at : Date.now(), list: inst };
           const ids = new Set(inst.filter(i => NetworkView.isElementLns(i.driver)).map(i => i.id));
           if (ids.size) {
             const before = sensors.length;
@@ -358,7 +516,9 @@ class NetworkView {
       const addGw = d => { if (!gwSeen.has(d.id) && NetAnalysis.isGatewayDevice(d)) { gwSeen.add(d.id); gatewayDevices.push(d); } };
       inDevScope.filter(d => NetAnalysis.isGatewayDevice(d) && this._inScope(d, gwScope)).forEach(addGw);
       try {
-        const gws = await this._loadScope(gwScope, { filters: [...NET_GW_FILTERS, null], purpose: 'gw', maxItems: 10000, label: 'Loading gateways…' });
+        const gws = reuse
+          ? reuse.filter(d => NetAnalysis.isGatewayDevice(d) && this._inScope(d, gwScope))
+          : await this._loadScope(gwScope, { filters: [...NET_GW_FILTERS, null], purpose: 'gw', maxItems: 10000, label: 'Loading gateways…' });
         gws.forEach(addGw);
         if (this._filterOk.gw === NET_GW_FILTERS.length) warnings.push('The server did not accept the gateway filter – all devices in the gateway scope were scanned. Restrict the gateway scope (e.g. to the gateway mandate) to reduce requests.');
       } catch (e) {
@@ -367,39 +527,24 @@ class NetworkView {
       }
       cancelled();
 
-      // 4. Uplinks per device – skipped for devices ELEMENT reports as silent for the whole window
-      const packetsByDevice = new Map();
+      // 4. Uplinks – skipped for devices ELEMENT reports as silent for the whole window
+      let packetsByDevice = new Map();
       let statsSilent = 0;
       if (!quick) {
         const todo = sensors.filter(d => {
-          const last = d.stats?.transceived_at;
-          if (last && Date.parse(/Z|[+-]\d\d:?\d\d$/.test(last) ? last : `${last}Z`) < afterMs) { statsSilent++; return false; }
+          const last = NetAnalysis.tsMs(d.stats?.transceived_at);
+          if (last != null && last < afterMs) { statsSilent++; return false; }
           return true;
         });
-        let done = 0;
-        const started = Date.now();
-        const res = await runConcurrent(todo, async d => {
-          if (this._cancel) throw new Error('cancelled');
-          const params = { limit: perDevice, after, sort_direction: 'descending' };
-          if (uplinks) params.packet_type = 'up';
-          const r = await this._api.get(`/devices/${d.id}/packets`, params);
-          packetsByDevice.set(d.id, Array.isArray(r.body) ? r.body : []);
-          done++;
-          if (done % 5 === 0 || done === todo.length) {
-            const eta = done ? Math.round((Date.now() - started) / done * (todo.length - done) / 1000) : 0;
-            this._progress(`<span class="spinner-border spinner-border-sm me-1"></span>Loading packets… ${done} / ${todo.length} devices${statsSilent ? ` (${statsSilent} skipped: no uplink in window)` : ''}${eta > 5 ? ` · ~${eta}s left` : ''}`);
-          }
-        }, 4);
-        if (this._cancel) warnings.push(`Analysis was cancelled after ${done} of ${todo.length} devices – the remaining devices are rated from ELEMENT statistics.`);
-        const failed = res.failed.filter(f => f.error !== 'cancelled');
-        if (failed.length) warnings.push(`Packets could not be loaded for ${failed.length} device(s) (e.g. ${esc(failed[0].item.name || failed[0].item.id)}: ${esc(failed[0].error)}). They are rated from ELEMENT statistics.`);
+        packetsByDevice = await this._loadPackets(todo, { after, afterMs, perDevice, uplinks, strategy, useCache, devScope, statsSilent, warnings });
 
         // 5. Gateways that received packets but are outside the gateway scope
         if (lookup && !this._cancel) {
           const known = new Set(gatewayDevices.flatMap(g => NetAnalysis.gatewayIdsFromDevice(g)));
           const unseen = new Set();
-          packetsByDevice.forEach(list => list.forEach(p => NetAnalysis.extractGateways(p).forEach(g => { if (!known.has(g.id)) unseen.add(g.id); })));
-          const ids = [...unseen].filter(NetAnalysis.isEuiLike);
+          packetsByDevice.forEach(list => list.forEach(p => (p._gws || NetAnalysis.extractGateways(p)).forEach(g => { if (!known.has(g.id)) unseen.add(g.id); })));
+          const recentMiss = id => useCache && Date.now() - (this._gwMiss.get(id) || 0) < NET_CACHE_MS;
+          const ids = [...unseen].filter(id => NetAnalysis.isEuiLike(id) && !recentMiss(id));
           for (let k = 0; k < ids.length && !this._cancel; k += 20) {
             const batch = ids.slice(k, k + 20);
             const variants = [...new Set(batch.flatMap(id => [id, id.toLowerCase(), id.replace(/^0{4}/, '')]))];
@@ -409,6 +554,8 @@ class NetworkView {
               const wanted = new Set(batch);
               const matching = found.filter(d => NetAnalysis.gatewayIdsFromDevice(d).some(id => wanted.has(id)));
               matching.forEach(addGw);
+              const hit = new Set(matching.flatMap(d => NetAnalysis.gatewayIdsFromDevice(d)));
+              batch.forEach(id => { if (!hit.has(id)) this._gwMiss.set(id, Date.now()); });
               if (matching.length < found.length) {
                 warnings.push('The server ignored the gateway lookup filter – gateways outside the scope are shown as external. Widen the gateway scope instead.');
                 break;
@@ -429,7 +576,7 @@ class NetworkView {
       this._recompute(true);
       const s = this._result.summary;
       const reqs = (this._api.requestCount || 0) - reqStart;
-      this._progress(`${this._cancel ? '<span class="text-warning">Partial result.</span> ' : ''}Analysed <strong>${s.devices}</strong> devices and <strong>${s.gateways}</strong> gateways in the last ${hours < 48 ? `${hours} h` : `${Math.round(hours / 24)} days`}: ${quick ? 'ELEMENT statistics only' : `<strong>${s.packets}</strong> packets`}${s.fromStats && !quick ? `, ${s.fromStats} device(s) rated from ELEMENT statistics (no uplink in window)` : ''} · ${reqs} API request(s).`);
+      this._progress(`${this._cancel ? '<span class="text-warning">Partial result.</span> ' : ''}Analysed <strong>${s.devices}</strong> devices and <strong>${s.gateways}</strong> gateways in the last ${hours < 48 ? `${hours} h` : `${Math.round(hours / 24)} days`}: ${quick ? 'ELEMENT statistics only' : `<strong>${s.packets}</strong> packets`}${s.fromStats && !quick ? `, ${s.fromStats} device(s) rated from ELEMENT statistics (no uplink in window)` : ''} · <strong>${reqs}</strong> API request(s)${this._loadSummary(quick, reuse)}.`);
     } catch (e) {
       if (e.message === 'cancelled') this._progress('Analysis cancelled.');
       else { this._progress(`<span class="text-danger">Failed: ${esc(e.message)}</span>`); this._toast.show(`Network analysis: ${e.message}`, 'danger'); }
@@ -443,6 +590,18 @@ class NetworkView {
     const d = String(driver || '');
     if (/element_?lns/i.test(d)) return true;
     return /lns/i.test(d) && !/chirpstack|actility|thingpark|loriot|tracknet|ttn|thethings|kerlink|everynet/i.test(d);
+  }
+
+  _loadSummary(quick, reuse) {
+    const parts = [];
+    if (reuse) parts.push('device list reused from Devices view');
+    const li = this._loadInfo, si = this._streamInfo;
+    if (!quick && li) {
+      if (si) parts.push(`${si.devices} device(s) via ${si.folders} folder stream(s) over the last ${si.windowSecs < 172800 ? `${Math.round(si.windowSecs / 3600)} h` : `${Math.round(si.windowSecs / 86400)} d`}${si.overhead ? ` (${si.overhead.toLocaleString()} packets of other devices skipped)` : ''}`);
+      if (li.perDevice) parts.push(`${li.perDevice} per-device request(s)`);
+      if (li.fromCache) parts.push(`${li.fromCache} from cache`);
+    }
+    return parts.length ? ` (${parts.join(', ')})` : '';
   }
 
   _thresholds() {
@@ -529,8 +688,8 @@ class NetworkView {
     const m = cl.measured;
     const measured = m ? `<div>Measured: ${m.devices.length} device(s) – ${['good', 'single', 'weak', 'silent'].filter(k => m.counts[k]).map(k => `${m.counts[k]} ${NET_STATUS[k].label.toLowerCase()}`).join(', ') || 'no gateway data'}</div>` : '<div class="text-muted">No devices in this cell – estimate only</div>';
     el.removeClass('d-none').html(`<strong style="color:${NET_CELL[cl.cls].color}">${esc(NET_CELL[cl.cls].label)}</strong>${cl.region ? ` · area ${esc(cl.region)}` : ''}
-      <div>Predicted best: ${fmtNum(cl.best, 0)} dBm${cl.bestGw ? ` (${esc(netGwLabel(cl.bestGw))})` : ''}${Number.isFinite(cl.second) ? ` · 2nd ${fmtNum(cl.second, 0)} dBm` : ''}</div>
-      <div>Nearest gateway: ${fmtDistance(cl.nearestGw)}</div>${measured}`);
+      <div>Predicted best: ${Number.isFinite(cl.best) ? `${fmtNum(cl.best, 0)} dBm` : `below ${fmtNum(this._cov.thresholdNone - 15, 0)} dBm`}${cl.bestGw ? ` (${esc(netGwLabel(cl.bestGw))})` : ''}${Number.isFinite(cl.second) ? ` · 2nd ${fmtNum(cl.second, 0)} dBm` : ''}</div>
+      <div>Nearest receiving gateway: ${fmtDistance(this._cov.nearestDistance(cl.center))}</div>${measured}`);
   }
 
   // ---------- filtering ----------
@@ -622,32 +781,27 @@ class NetworkView {
     }
   }
 
-  _gwIcon(gw, selected) {
+  _gwIcon(gw) {
     const cls = `net-gw-${gw.status}`;
     return L.divIcon({
       className: '',
-      html: `<div class="net-gw-icon ${cls}${selected ? ' selected' : ''}"><i class="bi bi-broadcast-pin"></i></div>`,
+      html: `<div class="net-gw-icon ${cls}"><i class="bi bi-broadcast-pin"></i></div>`,
       iconSize: [26, 26], iconAnchor: [13, 13],
     });
   }
 
+  // Full redraw of the base layers (after analysis or filter changes).
   _renderMap() {
     if (!this._map || !this._result) return;
     const L_ = this._layers;
-    Object.values(L_).forEach(l => l.clearLayers());
+    ['grid', 'range', 'linksAll', 'dev', 'gw'].forEach(k => L_[k].clearLayers());
     const { devices, gateways } = this._vis;
-    const sel = this._selection;
 
     if ($('#net-l-grid').prop('checked') && this._cov?.cells.length) {
       const im = this._coverageImage($('#net-l-covered').prop('checked'));
       const b = [this._cov.cells[0].bounds[0], this._cov.cells[this._cov.cells.length - 1].bounds[1]];
       L.imageOverlay(im.url, b, { className: 'net-cov-img', interactive: false, opacity: 1 }).addTo(L_.grid);
       L.rectangle(b, { renderer: this._renderer, color: '#495057', weight: 1, dashArray: '6 4', fill: false, interactive: false }).addTo(L_.grid);
-    }
-    if (sel?.kind === 'area') {
-      const rg = this._areaById.get(sel.id);
-      if (rg) rg.cells.forEach(cl => L.rectangle(cl.bounds, { renderer: this._renderer, color: '#c92a2a', weight: 0, fillColor: '#c92a2a', fillOpacity: 0.35, interactive: false }).addTo(L_.area));
-      if (rg) L.rectangle(rg.bounds, { renderer: this._renderer, color: '#c92a2a', weight: 2, fill: false, dashArray: '4 3', interactive: false }).addTo(L_.area);
     }
 
     if ($('#net-l-range').prop('checked')) {
@@ -656,61 +810,72 @@ class NetworkView {
       });
     }
 
-    // Links
-    const mode = $('#net-l-links').val();
-    const drawLink = (devLatLng, link) => {
-      if (!devLatLng || !link.gw.latlng) return;
-      L.polyline([devLatLng, link.gw.latlng], {
-        renderer: this._renderer, color: NET_LINK_COLOR[link.quality], weight: Math.min(1.5 + Math.log2(link.count + 1), 5), opacity: 0.75,
-      }).bindTooltip(`${esc(netGwLabel(link.gw))}<br>RSSI ${fmtNum(link.rssiAvg)} dBm · SNR ${fmtNum(link.snrAvg)} dB${link.margin != null ? ` · margin ${fmtNum(link.margin)} dB` : ''}<br>${link.count} packet(s) · ${fmtDistance(link.distance)}`, { sticky: true })
-        .addTo(L_.links);
-    };
-    if (mode === 'all') {
+    if ($('#net-l-links').val() === 'all') {
       let n = 0;
       for (const st of devices) {
         for (const link of st.links.values()) {
           if (!this._vis.gwKeys.has(link.gw.key)) continue;
           if (n++ >= NET_MAX_LINKS) break;
-          drawLink(st.latlng, link);
+          this._drawLink(st.latlng, link, L_.linksAll);
         }
         if (n >= NET_MAX_LINKS) break;
       }
-    } else if (mode === 'selected' && sel) {
-      const r = this._resolveSelection();
-      if (sel.kind === 'device' && r) r.links.forEach(link => drawLink(r.latlng, link));
-      if (sel.kind === 'gw' && r) {
-        r.devices.forEach((_, devId) => {
-          const st = this._devById.get(devId);
-          const link = st?.links.get(r.key);
-          if (link) drawLink(st.latlng, link);
-        });
-      }
     }
 
+    // Tooltips are built lazily (function content) – thousands of markers stay cheap.
     if ($('#net-l-dev').prop('checked')) {
-      devices.filter(st => st.latlng).forEach(st => {
+      devices.forEach(st => {
+        if (!st.latlng) return;
         L.circleMarker(st.latlng, {
           renderer: this._renderer, radius: 6, color: '#fff', weight: 1.5, fillColor: NET_STATUS[st.status].color, fillOpacity: 0.95,
-        }).bindTooltip(`<strong>${esc(st.name)}</strong><br>${esc(NET_STATUS[st.status].label)} · ${st.gwCount} gateway(s) · ${st.packets} pkt`)
+        }).bindTooltip(() => `<strong>${esc(st.name)}</strong><br>${esc(NET_STATUS[st.status].label)} · ${st.source === 'stats' ? 'ELEMENT statistics' : `${st.gwCount} gateway(s) · ${st.packets} pkt`}`)
           .on('click', () => this._select({ kind: 'device', id: st.id }))
           .addTo(L_.dev);
       });
     }
 
     if ($('#net-l-gw').prop('checked')) {
-      gateways.filter(g => g.latlng).forEach(g => {
-        const selected = sel?.kind === 'gw' && sel.id === g.key;
-        L.marker(g.latlng, { icon: this._gwIcon(g, selected), zIndexOffset: selected ? 2000 : 1000, keyboard: false })
-          .bindTooltip(`<strong>${esc(netGwLabel(g))}</strong><br>${g.deviceCount} device(s) · ${g.packets} pkt${g.soleFor ? `<br>Only gateway for ${g.soleFor} device(s)` : ''}`)
+      gateways.forEach(g => {
+        if (!g.latlng) return;
+        L.marker(g.latlng, { icon: this._gwIcon(g), zIndexOffset: 1000, keyboard: false })
+          .bindTooltip(() => `<strong>${esc(netGwLabel(g))}</strong><br>${esc(NET_GW_STATUS[g.status]?.label || '')} · ${g.deviceCount} device(s) · ${g.packets} pkt${g.soleFor ? `<br>Only gateway for ${g.soleFor} device(s)` : ''}`)
           .on('click', () => this._select({ kind: 'gw', id: g.key }))
           .addTo(L_.gw);
       });
     }
+    this._renderSelectionLayers();
+  }
 
-    // Highlight ring for the selected device
-    if (sel?.kind === 'device') {
-      const st = this._devById.get(sel.id);
-      if (st?.latlng) L.circleMarker(st.latlng, { radius: 11, color: '#1971c2', weight: 3, fill: false, interactive: false }).addTo(L_.hl);
+  _drawLink(devLatLng, link, layer) {
+    if (!devLatLng || !link.gw.latlng) return;
+    L.polyline([devLatLng, link.gw.latlng], {
+      renderer: this._renderer, color: NET_LINK_COLOR[link.quality], weight: Math.min(1.5 + Math.log2(link.count + 1), 5), opacity: 0.75,
+    }).bindTooltip(() => `${esc(netGwLabel(link.gw))}<br>RSSI ${fmtNum(link.rssiAvg)} dBm · SNR ${fmtNum(link.snrAvg)} dB${link.margin != null ? ` · margin ${fmtNum(link.margin)} dB` : ''}<br>${link.count} packet(s) · ${fmtDistance(link.distance)}`, { sticky: true })
+      .addTo(layer);
+  }
+
+  // Cheap redraw for selection changes: links of the selection, area highlight, rings.
+  _renderSelectionLayers() {
+    if (!this._map || !this._result) return;
+    const L_ = this._layers;
+    ['links', 'area', 'hl'].forEach(k => L_[k].clearLayers());
+    const sel = this._selection, r = this._resolveSelection();
+    if (!sel || !r) return;
+    if (sel.kind === 'area') {
+      r.cells.forEach(cl => L.rectangle(cl.bounds, { renderer: this._renderer, color: '#c92a2a', weight: 0, fillColor: '#c92a2a', fillOpacity: 0.35, interactive: false }).addTo(L_.area));
+      L.rectangle(r.bounds, { renderer: this._renderer, color: '#c92a2a', weight: 2, fill: false, dashArray: '4 3', interactive: false }).addTo(L_.area);
+      return;
+    }
+    if ($('#net-l-links').val() === 'selected') {
+      if (sel.kind === 'device') r.links.forEach(link => this._drawLink(r.latlng, link, L_.links));
+      else r.devices.forEach((_, devId) => {
+        const st = this._devById.get(devId);
+        const link = st?.links.get(r.key);
+        if (link) this._drawLink(st.latlng, link, L_.links);
+      });
+    }
+    if (r.latlng) {
+      L.circleMarker(r.latlng, { radius: sel.kind === 'gw' ? 19 : 11, color: sel.kind === 'gw' ? '#fab005' : '#1971c2', weight: 3, fill: false, interactive: false }).addTo(L_.hl);
     }
   }
 
@@ -731,10 +896,12 @@ class NetworkView {
 
   _select(sel, zoom = false) {
     this._selection = sel;
-    if (sel && $('#net-l-links').val() === 'none') $('#net-l-links').val('selected');
-    this._renderMap();
+    if (sel && $('#net-l-links').val() === 'none') { $('#net-l-links').val('selected'); }
+    this._renderSelectionLayers();
     this._renderSelection();
-    this._renderTable();
+    // Only move the row highlight instead of re-rendering the table.
+    $('#net-tbody tr.table-active').removeClass('table-active');
+    if (sel) $('#net-tbody tr[data-id]').filter((_, tr) => tr.dataset.id === sel.id).addClass('table-active');
     if (zoom) this._zoomSelection();
   }
 
@@ -971,15 +1138,15 @@ class NetworkView {
     if (!this._cov) return;
     const rows = [['area', 'size_km2', 'cells', 'basis', 'devices_inside', 'silent_or_weak', 'best_predicted_rssi', 'nearest_gateway_m', 'lat', 'lng', 'south', 'west', 'north', 'east', 'extends_to_border', 'affected_devices']];
     this._cov.regions.forEach(r => rows.push([r.id, r.areaKm2.toFixed(3), r.size, r.measuredOnly ? 'measured' : (r.devicesInside ? 'model+devices' : 'estimate'), r.devicesInside, r.affected.length,
-      r.bestPredicted.toFixed(1), r.nearestGw.toFixed(0), r.point[0].toFixed(6), r.point[1].toFixed(6), r.bounds[0][0].toFixed(6), r.bounds[0][1].toFixed(6), r.bounds[1][0].toFixed(6), r.bounds[1][1].toFixed(6), r.edge, r.affected.map(d => d.name).join('; ')]));
+      Number.isFinite(r.bestPredicted) ? r.bestPredicted.toFixed(1) : '', Number.isFinite(r.nearestGw) ? r.nearestGw.toFixed(0) : '', r.point[0].toFixed(6), r.point[1].toFixed(6), r.bounds[0][0].toFixed(6), r.bounds[0][1].toFixed(6), r.bounds[1][0].toFixed(6), r.bounds[1][1].toFixed(6), r.edge, r.affected.map(d => d.name).join('; ')]));
     downloadFile(`elmo-no-reception-areas-${this._fileStamp()}.csv`, toCsv(rows), 'text/csv');
   }
 
   _exportCells() {
     if (!this._cov) return;
     const rows = [['lat', 'lng', 'class', 'predicted_class', 'best_predicted_rssi', 'second_predicted_rssi', 'best_gateway', 'nearest_gateway_m', 'devices', 'area']];
-    this._cov.cells.forEach(c => rows.push([c.center[0].toFixed(6), c.center[1].toFixed(6), c.cls, c.predicted, c.best.toFixed(1), Number.isFinite(c.second) ? c.second.toFixed(1) : '',
-      c.bestGw ? netGwLabel(c.bestGw) : '', c.nearestGw.toFixed(0), c.measured ? c.measured.devices.length : 0, c.region || '']));
+    this._cov.cells.forEach(c => rows.push([c.center[0].toFixed(6), c.center[1].toFixed(6), c.cls, c.predicted, Number.isFinite(c.best) ? c.best.toFixed(1) : '', Number.isFinite(c.second) ? c.second.toFixed(1) : '',
+      c.bestGw ? netGwLabel(c.bestGw) : '', this._cov.nearestDistance(c.center).toFixed(0), c.measured ? c.measured.devices.length : 0, c.region || '']));
     downloadFile(`elmo-reception-grid-${this._fileStamp()}.csv`, toCsv(rows), 'text/csv');
   }
 }

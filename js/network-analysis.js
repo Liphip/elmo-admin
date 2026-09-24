@@ -155,6 +155,20 @@ const NetAnalysis = (() => {
     return null;
   }
 
+  // Reduces a packet to what the analysis needs (keeps memory low for tens of thousands of
+  // packets and avoids re-parsing when devices are re-rated).
+  function compactPacket(p) {
+    return { transceived_at: p.transceived_at || p.inserted_at || null, _gws: extractGateways(p), _sf: extractSf(p) };
+  }
+
+  // ELEMENT device stats: packet_interval = { months, days, secs, microsecs } -> seconds
+  function packetIntervalSecs(device) {
+    const iv = device?.stats?.packet_interval;
+    if (!iv || typeof iv !== 'object') return null;
+    const secs = (num(iv.months) || 0) * 30 * 86400 + (num(iv.days) || 0) * 86400 + (num(iv.secs) || 0) + (num(iv.microsecs) || 0) / 1e6;
+    return secs > 0 ? secs : null;
+  }
+
   function linkMargin(snr, sf) {
     if (snr == null || sf == null) return null;
     const floor = SF_SNR_FLOOR[Math.round(sf)];
@@ -325,9 +339,9 @@ const NetAnalysis = (() => {
       packets.forEach(p => {
         const t = p.transceived_at || p.inserted_at || null;
         if (t && (!st.lastSeen || t > st.lastSeen)) st.lastSeen = t;
-        const sf = extractSf(p);
+        const sf = p._sf !== undefined ? p._sf : extractSf(p);
         add(st.sf, sf);
-        const gws = extractGateways(p);
+        const gws = p._gws || extractGateways(p);
         if (!gws.length) return;
         st.withGwInfo++;
         add(st.gwPerPacket, gws.length);
@@ -510,6 +524,16 @@ const NetAnalysis = (() => {
    * Classes: covered (≥2 gateways), single (1 gateway), marginal (best link within the fade
    * margin of the weak threshold), none (no reception expected / observed).
    */
+  // Distance from the nearest gateway to a lat/lng rectangle (0 when inside).
+  function rectDistance([[s, w], [n, e]], gws) {
+    let mn = Infinity;
+    gws.forEach(g => {
+      const p = [Math.min(Math.max(g.latlng[0], s), n), Math.min(Math.max(g.latlng[1], w), e)];
+      mn = Math.min(mn, haversine(p, g.latlng));
+    });
+    return mn;
+  }
+
   function estimateCoverage(result, opts = {}) {
     const th = result.thresholds;
     const fade = opts.fadeMargin ?? 8;
@@ -554,28 +578,47 @@ const NetAnalysis = (() => {
       m.devices.push(st); m.counts[st.status]++;
     });
 
-    const gwModels = gws.map(g => ({ g, m: model.perGw.get(g.key) || model.global }));
-    const cells = new Array(rows * cols);
+    // Best / second-best predicted RSSI per cell. Each gateway only visits the cells within the
+    // distance at which its prediction falls 15 dB below the weak threshold – beyond that it can
+    // neither provide reception nor change a cell's class. Keeps large areas with hundreds of
+    // gateways fast (cells × gateways would be tens of millions of evaluations).
+    const nCells = rows * cols;
+    const best = new Float64Array(nCells).fill(-Infinity), second = new Float64Array(nCells).fill(-Infinity);
+    const bestIdx = new Int32Array(nCells).fill(-1);
+    const floorDb = th.rssiWeak - 15;
+    gws.forEach((g, gi) => {
+      const m = model.perGw.get(g.key) || model.global;
+      const R = Math.min(100000, 1000 * 10 ** ((m.r1k - floorDb) / (10 * m.n)));
+      const [glat, glng] = g.latlng;
+      const rA = Math.max(0, Math.floor((glat - R / 111320) / dLat) - i0), rB = Math.min(rows - 1, Math.floor((glat + R / 111320) / dLat) - i0);
+      for (let r = rA; r <= rB; r++) {
+        const la = (i0 + r + 0.5) * dLat;
+        const kx = 111320 * Math.cos(la * Math.PI / 180);
+        const dy = (la - glat) * 111320;
+        if (Math.abs(dy) > R) continue;
+        const half = Math.sqrt(R * R - dy * dy) / kx;
+        const cA = Math.max(0, Math.floor((glng - half) / dLng) - j0), cB = Math.min(cols - 1, Math.floor((glng + half) / dLng) - j0);
+        for (let c = cA; c <= cB; c++) {
+          const dx = ((j0 + c + 0.5) * dLng - glng) * kx;
+          const v = predictRssi(m, Math.sqrt(dx * dx + dy * dy));
+          const k = r * cols + c;
+          if (v > best[k]) { second[k] = best[k]; best[k] = v; bestIdx[k] = gi; } else if (v > second[k]) second[k] = v;
+        }
+      }
+    });
+    const cells = new Array(nCells);
     for (let r = 0; r < rows; r++) {
       const la = (i0 + r + 0.5) * dLat;
-      const kx = 111320 * Math.cos(la * Math.PI / 180);
       for (let c = 0; c < cols; c++) {
-        const lo = (j0 + c + 0.5) * dLng;
-        let best = -Infinity, second = -Infinity, bestGw = null, nearest = Infinity;
-        for (const { g, m } of gwModels) {
-          const dy = (la - g.latlng[0]) * 111320, dx = (lo - g.latlng[1]) * kx;
-          const d = Math.sqrt(dx * dx + dy * dy);
-          if (d < nearest) nearest = d;
-          const v = predictRssi(m, d);
-          if (v > best) { second = best; best = v; bestGw = g; } else if (v > second) second = v;
-        }
+        const idx = r * cols + c;
+        const b = best[idx], sc = second[idx];
         let cls;
-        if (best < th.rssiWeak) cls = 'none';
-        else if (best < covered) cls = 'marginal';
-        else if (second >= covered) cls = 'covered';
+        if (b < th.rssiWeak) cls = 'none';
+        else if (b < covered) cls = 'marginal';
+        else if (sc >= covered) cls = 'covered';
         else cls = 'single';
-        const cell = { idx: r * cols + c, r, c, center: [la, lo], predicted: cls, cls, best, second, bestGw, nearestGw: nearest, measured: null };
-        const m = measured.get(cell.idx);
+        const cell = { idx, r, c, center: [la, (j0 + c + 0.5) * dLng], predicted: cls, cls, best: b, second: sc, bestGw: bestIdx[idx] >= 0 ? gws[bestIdx[idx]] : null, measured: null };
+        const m = measured.get(idx);
         if (m) {
           const k = m.counts, rated = m.devices.length - k.unknown, bad = k.silent + k.weak;
           cell.measured = m;
@@ -586,9 +629,10 @@ const NetAnalysis = (() => {
             else cell.cls = 'marginal';
           }
         }
-        cells[cell.idx] = cell;
+        cells[idx] = cell;
       }
     }
+    const nearestDistance = ll => gws.reduce((mn, g) => Math.min(mn, haversine(ll, g.latlng)), Infinity);
     cells.forEach(cl => {
       const la = (i0 + cl.r) * dLat, lo = (j0 + cl.c) * dLng;
       cl.bounds = [[la, lo], [la + dLat, lo + dLng]];
@@ -623,7 +667,7 @@ const NetAnalysis = (() => {
         affected,
         measuredCells: members.filter(cl => cl.measured).length,
         bestPredicted: Math.max(...members.map(cl => cl.best)),
-        nearestGw: Math.min(...members.map(cl => cl.nearestGw)),
+        nearestGw: rectDistance(bounds, gws),
       });
     });
     regions.forEach(rg => {
@@ -639,13 +683,13 @@ const NetAnalysis = (() => {
 
     const counts = { covered: 0, single: 0, marginal: 0, none: 0 };
     cells.forEach(cl => counts[cl.cls]++);
-    return { ...base, cellMeters, cells, regions, rows, cols, counts, bounds: [[s, w], [n, e]], requestedCellMeters: opts.cellMeters ?? 250 };
+    return { ...base, cellMeters, cells, regions, rows, cols, counts, bounds: [[s, w], [n, e]], requestedCellMeters: opts.cellMeters ?? 250, nearestDistance };
   }
 
   return {
     SF_SNR_FLOOR, normalizeGwId, extractGateways, extractSf, linkMargin, gatewayIdsFromDevice,
     deviceLatLng, haversine, percentile, analyze, fitPathLoss, estimateCoverage, isEuiLike,
-    isGatewayDevice, gatewayLastPing, statsSummary, routerIdFromEntry,
+    isGatewayDevice, gatewayLastPing, statsSummary, routerIdFromEntry, compactPacket, packetIntervalSecs, tsMs,
   };
 })();
 

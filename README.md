@@ -13,6 +13,8 @@ Elmo is a client-side web application for managing devices, folders (tags), mand
 - **Network** (ELEMENT LNS): Map of gateways and devices; see which gateway receives which device (RSSI, SNR, link margin), find silent / weak / single-gateway devices, estimate areas without reception (also where no devices exist), export as CSV
 - **API Log**: Monitor all API requests with duration and status
 - **Bulk Operations**: Add/remove devices from folders, send actions to multiple devices, bulk profile editing
+- **Activity at a glance**: last uplink / gateway forwarder ping per device from ELEMENT statistics, activity filter (e.g. silent > 7 days), multi-select folder and mandate filters, CSV export
+- **Light / dark theme** (follows the OS by default)
 
 ## Usage
 
@@ -49,7 +51,12 @@ Built for LoRaWAN devices on the **ELEMENT LNS** driver. The **Network** view lo
 
 - **Scopes**: devices and gateways have separate scopes – mandates (multi-select), folders (multi-select, any of) and a name filter each. Scopes are applied as API filters (`/tags/:id/devices` per folder, `mandate_id_is`, `name_ilike`) and re-checked client-side. With *Element LNS only* (default) devices without an interface on an ELEMENT LNS driver instance (`GET /drivers/instances`) are skipped.
 - **Gateways** are devices with a gateway-management interface (`opts.gateway_id`); ELEMENT does not return a device `type` on every instance. They are loaded with the AbacusSql filter `interfaces[0].opts.gateway_id != null` (falls back to scanning the gateway scope if the server rejects it). Gateways that received packets but are outside the gateway scope are looked up by EUI (20 per request); gateways not visible to the key are shown as *external*. Packets are matched via `gateways[].gateway_id` (or `meta.gateway_stats[].router_id_hex`). Gateway state: *receiving*, *idle*, *offline* (last packet-forwarder ping older than 1 h), *external*.
-- **Fewer requests**: devices whose ELEMENT statistics (`stats.transceived_at`) show no uplink within the time window are rated silent without loading packets. *Quick* mode rates all devices from ELEMENT statistics (average RSSI/SNR/SF/gateway count) without any packet request – no per-gateway links or reception estimate in that mode. The number of API requests is shown after each run.
+- **Fewer requests** (Element's default limit is 50 requests / 10 s per key, so request count ≈ run time):
+  - Devices whose ELEMENT statistics (`stats.transceived_at`) show no uplink in the window are rated silent without loading packets.
+  - *Folder streams* (default): uplinks are loaded with `/tags/:id/packets/stream` – one request per folder. The stream window is derived from the devices' `stats.packet_interval` (enough for a few uplinks per device, capped so the transfer stays about as large as per-device loading); a small covering set of folders is picked automatically. Only devices that deliver too few packets that way (rare senders) get a per-device request.
+  - *Cache* (15 min): packets, the driver-instance list and unsuccessful gateway lookups are reused; the device list of the Devices view is reused when it is complete and fresh. Re-running with other thresholds, a sub-scope or a shorter window usually needs no requests at all.
+  - *Quick* mode rates all devices from ELEMENT statistics without any packet request – no per-gateway links or reception estimate in that mode.
+  - The number of API requests and where the data came from is shown after each run.
 - **Device rating**: *good* (≥ 2 gateways, healthy link), *single gateway* (no redundancy), *weak* (best link below the RSSI or link-margin threshold), *silent* (no uplink in the window), *no gateway data*. Link margin = SNR − demodulation floor of the spreading factor (SF7 −7.5 dB … SF12 −20 dB).
 - **Reception map / no-reception areas** – also where no devices exist:
   1. A log-distance path-loss model `RSSI = RSSI@1km − 10·n·log10(d / 1 km)` is fitted to the measured links (exponent from within-gateway variation, per-gateway level; defaults when data is sparse).

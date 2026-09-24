@@ -132,7 +132,7 @@ class DeviceView {
     $('#dev-stats').on('click', () => this.showStats());
     $('#dev-sel-all').on('change', e => this._selectAll(e.target.checked));
     $('#dev-filter-name').on('input', () => { clearTimeout(this._filterTimer); this._filterTimer = setTimeout(() => this._filter(), 300); });
-    $('#dev-filter-type, #dev-filter-location').on('change', () => this._filter());
+    $('#dev-filter-type, #dev-filter-location, #dev-filter-activity').on('change', () => this._filter());
     $('#dev-filter-apply').on('click', () => this._filter());
     $('#dev-filter-regex').on('click', () => {
       this._regexSearch = !this._regexSearch;
@@ -141,7 +141,7 @@ class DeviceView {
     });
     $('#dev-filter-reset').on('click', () => {
       $('#dev-filter-name').val('');
-      $('#dev-filter-type, #dev-filter-location').val('');
+      $('#dev-filter-type, #dev-filter-location, #dev-filter-activity').val('');
       this._folderMs.values = []; this._mandateMs.values = [];
       this._regexSearch = false;
       $('#dev-filter-regex').removeClass('active');
@@ -222,7 +222,8 @@ class DeviceView {
       let cursor = this._cursor;
       let loaded = 0;
       do {
-        const params = { limit: 100, sort: 'inserted_at', sort_direction: 'ascending', with_profile: 1 };
+        // Profile data is loaded on demand (detail panel, bulk profile edit) – keeps the list light.
+        const params = { limit: 100, sort: 'inserted_at', sort_direction: 'ascending' };
         if (cursor) params.retrieve_after = cursor;
         const data = await this._api.get('/devices', params);
         const body = Array.isArray(data.body) ? data.body : [];
@@ -233,6 +234,9 @@ class DeviceView {
       this._cursor = cursor;
       this._hasMore = !!cursor;
       this._state.setDevices(all);
+      this._state.devicesLoadedAt = Date.now();
+      window._app?._tagV.render();
+      window._app?._manV.render();
       $('#device-count').text(all.length + (this._hasMore ? '+' : ''));
       window._app?._actV._renderDeviceChooser();
       $('#dev-table-wrap').removeClass('d-none');
@@ -285,12 +289,13 @@ class DeviceView {
   _exportCsv() {
     const list = this._filtered.length ? this._filtered : this._state.devices;
     if (!list.length) { this._toast.show('Load devices first', 'warning'); return; }
-    const rows = [['id', 'name', 'slug', 'type', 'mandate', 'folders', 'latitude', 'longitude', 'eui', 'created', 'updated']];
+    const rows = [['id', 'name', 'slug', 'kind', 'mandate', 'folders', 'latitude', 'longitude', 'eui', 'last_uplink', 'avg_rssi', 'avg_snr', 'avg_gateways', 'created', 'updated']];
     list.forEach(d => {
       const ll = NetAnalysis.deviceLatLng(d);
       const euis = (d.interfaces || []).flatMap(i => Object.entries(i.opts || {}).filter(([k, v]) => /eui/i.test(k) && v).map(([, v]) => v));
-      rows.push([d.id, d.name, d.slug, d.type, this._state.mandateMap[d.mandate_id]?.name || d.mandate_id, (d.tags || []).map(t => t.name).join('; '),
-        ll?.[0], ll?.[1], [...new Set(euis)].join('; '), d.inserted_at, d.updated_at]);
+      const gw = NetAnalysis.isGatewayDevice(d);
+      rows.push([d.id, d.name, d.slug, gw ? 'gateway' : (d.type || 'device'), this._state.mandateMap[d.mandate_id]?.name || d.mandate_id, (d.tags || []).map(t => t.name).join('; '),
+        ll?.[0], ll?.[1], [...new Set(euis)].join('; '), gw ? NetAnalysis.gatewayLastPing(d) : d.stats?.transceived_at, d.stats?.avg_rssi, d.stats?.avg_snr, d.stats?.avg_gw_count, d.inserted_at, d.updated_at]);
     });
     downloadFile(`elmo-devices-${new Date().toISOString().slice(0, 10)}.csv`, toCsv(rows), 'text/csv');
   }
@@ -304,12 +309,23 @@ class DeviceView {
     if (q)    list = list.filter(d => matcher(d.name) || matcher(d.slug) || matcher(d.id) ||
       (d.interfaces || []).some(i => Object.entries(i.opts || {}).some(([k, v]) => /eui|address/i.test(k) && typeof v === 'string' && v && matcher(v))));
     if (loc)  list = list.filter(d => !!NetAnalysis.deviceLatLng(d) === (loc === 'with'));
+    const act = $('#dev-filter-activity').val();
+    if (act) {
+      const now = Date.now(), H = 3600e3;
+      const ageOk = { '24h': a => a != null && a < 24 * H, '7d': a => a != null && a < 168 * H, silent1: a => a == null || a >= 24 * H, silent7: a => a == null || a >= 168 * H, never: a => a == null }[act];
+      list = list.filter(d => {
+        if (NetAnalysis.isGatewayDevice(d)) return false;
+        const t = NetAnalysis.tsMs(d.stats?.transceived_at);
+        return ageOk(t == null ? null : now - t);
+      });
+    }
     if (type) list = list.filter(d => NetAnalysis.isGatewayDevice(d) === (type === 'gateway'));
     if (fids.length) list = list.filter(d => Array.isArray(d.tags) && d.tags.some(t => fids.includes(t.id)));
     if (mandateIds.length) list = list.filter(d => mandateIds.includes(d.mandate_id));
     const dir = this._sortDir === 'asc' ? 1 : -1;
     const col = this._sortCol;
-    const key = d => String(d[col] || '').toLowerCase();
+    const key = col === 'last_uplink' ? d => String(NetAnalysis.isGatewayDevice(d) ? (NetAnalysis.gatewayLastPing(d) || '') : (d.stats?.transceived_at || ''))
+      : d => String(d[col] || '').toLowerCase();
     list = [...list].sort((a,b) => (key(a) < key(b) ? -dir : key(a) > key(b) ? dir : 0));
     this._filtered = list;
     this._page = 1;
@@ -333,19 +349,31 @@ class DeviceView {
         <td class="text-muted small d-none d-md-table-cell">${esc(d.slug)}</td>
         <td>${typeBadge(NetAnalysis.isGatewayDevice(d) ? 'gateway' : (d.type || 'device'))}</td>
         <td>${tags}</td>
-        <td class="text-muted small d-none d-lg-table-cell">${fmtDate(d.inserted_at)}</td>
+        <td class="small d-none d-lg-table-cell">${this._lastUplinkCell(d)}</td>
+        <td class="text-muted small d-none d-xl-table-cell">${fmtDate(d.inserted_at)}</td>
         <td>${getMandateLabel(this._state, d.mandate_id)}</td>
         <td><button class="btn btn-sm btn-outline-secondary py-0 dev-open" data-id="${d.id}" title="Details"><i class="bi bi-box-arrow-up-right"></i></button></td>
       </tr>`;
     }).join('');
     document.getElementById('devices-tbody').innerHTML = rows ||
-      (this._state.isLoaded.devices ? '<tr><td colspan="8" class="text-center text-muted py-3">No devices match filters.</td></tr>' : '');
+      (this._state.isLoaded.devices ? '<tr><td colspan="9" class="text-center text-muted py-3">No devices match filters.</td></tr>' : '');
     $('th.sortable').each((_, th) => {
       const icon = $(th).find('i');
       if ($(th).data('col') === this._sortCol)
         icon.attr('class', `bi bi-arrow-${this._sortDir === 'asc' ? 'up' : 'down'} small text-primary`);
       else icon.attr('class', 'bi bi-arrow-down-up text-muted small');
     });
+  }
+
+  // Last uplink (sensors) or last packet-forwarder ping (gateways) from ELEMENT statistics.
+  _lastUplinkCell(d) {
+    const gw = NetAnalysis.isGatewayDevice(d);
+    const t = gw ? NetAnalysis.gatewayLastPing(d) : d.stats?.transceived_at;
+    if (!t) return '<span class="text-muted">—</span>';
+    const age = Date.now() - (NetAnalysis.tsMs(t) ?? 0);
+    const cls = age > (gw ? 3600e3 : 7 * 86400e3) ? 'text-danger' : age > (gw ? 600e3 : 86400e3) ? 'text-warning-emphasis' : 'text-success';
+    const warn = !gw && d.stats?.nominally_sending === false ? ' <i class="bi bi-exclamation-triangle text-warning" title="ELEMENT: not sending nominally"></i>' : '';
+    return `<span class="${cls}" title="${esc(fmtDate(t))}${gw ? ' (packet-forwarder ping)' : ''}">${fmtAgo(t)}</span>${warn}`;
   }
 
   _selectAll(checked) {
@@ -425,15 +453,20 @@ class DeviceView {
   }
   _getSelDevices() { return [...this._selected].map(id => this._state.deviceMap[id]).filter(Boolean); }
 
-  _openBulkProfileModal() {
+  async _openBulkProfileModal() {
     if (!this._selected.size) return;
-    const hasProfilesLoaded = this._state.devices.some(d => Array.isArray(d.profile_data));
-    $('#bpe-load-note').toggleClass('d-none', hasProfilesLoaded);
-    $('#bpe-apply').prop('disabled', !hasProfilesLoaded);
+    $('#bpe-load-note').addClass('d-none');
+    $('#bpe-apply').prop('disabled', false);
     if (!$('#bpe-profile-sel').val() && this._state.profiles[0]) $('#bpe-profile-sel').val(this._state.profiles[0].id);
     $('input[name="bpe-mode"][value="set"]').prop('checked', true);
-    this._renderBulkProfileFields();
+    // The device list is loaded without profile data; fetch it for the first selected device
+    // so its current values can prefill the form.
+    this._bpeSample = null;
+    document.getElementById('bpe-fields').innerHTML = '<div class="text-muted small"><span class="spinner-border spinner-border-sm me-1"></span>Loading profile data…</div>';
     this._bulkProfileModal.show();
+    const first = this._getSelDevices()[0];
+    try { this._bpeSample = (await this._api.get(`/devices/${first.id}`, { with_profile: 1 })).body; } catch { /* prefill is optional */ }
+    this._renderBulkProfileFields();
   }
 
   _renderBulkProfileFields() {
@@ -448,7 +481,7 @@ class DeviceView {
       host.innerHTML = '<div class="text-muted small">This operation removes the selected profile from each chosen device.</div>';
       return;
     }
-    const sampleDevice = this._getSelDevices()[0];
+    const sampleDevice = this._bpeSample || this._getSelDevices()[0];
     const existing = (sampleDevice?.profile_data || []).find(entry => entry.profile_id === profile.id)?.data || {};
     host.innerHTML = renderProfileFieldEditor(profile, existing);
   }
@@ -632,11 +665,15 @@ class TagView {
       return true;
     });
     $('#tag-filter-count').text(this._filtered.length !== this._state.tags.length ? `${this._filtered.length} shown` : '');
+    const counts = new Map();
+    this._state.devices.forEach(d => (d.tags || []).forEach(t => counts.set(t.id, (counts.get(t.id) || 0) + 1)));
+    const loaded = this._state.isLoaded.devices;
     const rows = this._filtered.map(t => {
       const c = t.color_hue != null ? hueToHex(t.color_hue) : '#6c757d';
       return `<tr>
         <td>${esc(t.name)}</td>
         <td><span class="tag-swatch" style="background:${c}" title="Hue ${t.color_hue}"></span></td>
+        <td class="text-end">${loaded ? (counts.get(t.id) || 0) : '<span class="text-muted">—</span>'}</td>
         <td><code class="small">${esc(t.slug)}</code></td>
         <td class="text-muted small">${fmtDate(t.inserted_at)}</td>
         <td>${getMandateLabel(this._state, t.mandate_id)}</td>
@@ -647,7 +684,7 @@ class TagView {
         </td></tr>`;
     }).join('');
     document.getElementById('folders-tbody').innerHTML = rows ||
-      '<tr><td colspan="6" class="text-center text-muted py-3">No folders found.</td></tr>';
+      '<tr><td colspan="7" class="text-center text-muted py-3">No folders found.</td></tr>';
   }
   showStats() {
     const tags = this._state.tags;
@@ -780,10 +817,19 @@ class MandateView {
   _render() {
     const c = document.getElementById('mandates-container');
     if (!this._state.mandates.length) { c.innerHTML = '<div class="col-12 text-muted">No mandates visible with this API key.</div>'; return; }
+    const devCount = new Map(), gwCount = new Map(), tagCount = new Map();
+    this._state.devices.forEach(d => (NetAnalysis.isGatewayDevice(d) ? gwCount : devCount).set(d.mandate_id, ((NetAnalysis.isGatewayDevice(d) ? gwCount : devCount).get(d.mandate_id) || 0) + 1));
+    this._state.tags.forEach(t => tagCount.set(t.mandate_id, (tagCount.get(t.mandate_id) || 0) + 1));
+    const loaded = this._state.isLoaded.devices;
     c.innerHTML = this._state.mandates.map(m => `
       <div class="col-md-6 col-lg-4"><div class="card h-100"><div class="card-body">
         <h6 class="card-title">${esc(m.name)}</h6>
         <span class="badge bg-secondary">${esc(m.slug)}</span>
+        <div class="d-flex gap-3 small text-muted mt-2">
+          <span title="Devices (loaded list)"><i class="bi bi-cpu me-1"></i>${loaded ? devCount.get(m.id) || 0 : '—'}</span>
+          <span title="Gateways (loaded list)"><i class="bi bi-broadcast-pin me-1"></i>${loaded ? gwCount.get(m.id) || 0 : '—'}</span>
+          <span title="Folders"><i class="bi bi-folder me-1"></i>${tagCount.get(m.id) || 0}</span>
+        </div>
         <div class="input-group input-group-sm mt-2">
           <input type="text" class="form-control font-monospace" value="${esc(m.id)}" readonly>
           <button class="btn btn-outline-secondary copy-id" data-val="${esc(m.id)}" title="Copy ID"><i class="bi bi-clipboard"></i></button>
@@ -887,7 +933,7 @@ class ActionsView {
     $('#schedules-clear-selection').on('click', () => { this._selectedSchedules.clear(); this._renderSchedulesTable(); });
     $('#actions-cancel-selected').on('click', () => this._cancelSelected());
     $('#schedules-delete-selected').on('click', () => this._deleteSelectedSchedules());
-    $('#act-dev-search').on('input', () => this._renderDeviceChooser());
+    $('#act-dev-search').on('input', () => { clearTimeout(this._chooserTimer); this._chooserTimer = setTimeout(() => this._renderDeviceChooser(), 200); });
     $('#act-dev-all').on('click', () => this._selectVisibleCreateDevices(true));
     $('#act-dev-clear').on('click', () => this._selectVisibleCreateDevices(false));
     $('input[name="act-create-timing"]').on('change', () => this._syncTimingMode());
@@ -910,6 +956,7 @@ class ActionsView {
     $('#act-dev-list').on('change', '.act-dev-cb', e => {
       const id = $(e.currentTarget).data('id');
       e.target.checked ? this._selectedCreateDevices.add(id) : this._selectedCreateDevices.delete(id);
+      this._updateChooserCount();
     });
     this._populateTimeZones();
     this._syncTimingMode();
@@ -1040,20 +1087,26 @@ class ActionsView {
     $('#act-cron-wrap').toggleClass('d-none', mode !== 'cron');
     $('#act-create-tz-err').addClass('d-none');
   }
+  // Renders at most 300 matches – thousands of checkboxes made typing sluggish. "Select all"
+  // applies to every match, not only the rendered ones.
   _renderDeviceChooser() {
     const q = ($('#act-dev-search').val() || '').toLowerCase();
-    const rows = this._state.devices.filter(d => !q || (d.name || '').toLowerCase().includes(q) || (d.slug || '').toLowerCase().includes(q))
-      .map(d => `<div class="form-check">
+    this._chooserMatches = this._state.devices.filter(d => !NetAnalysis.isGatewayDevice(d) && (!q || (d.name || '').toLowerCase().includes(q) || (d.slug || '').toLowerCase().includes(q)));
+    const shown = this._chooserMatches.slice(0, 300);
+    const rows = shown.map(d => `<div class="form-check">
         <input class="form-check-input act-dev-cb" type="checkbox" data-id="${d.id}" id="act-dev-${d.id}" ${this._selectedCreateDevices.has(d.id) ? 'checked' : ''}>
         <label class="form-check-label small" for="act-dev-${d.id}">${esc(d.name || d.slug)} <span class="text-muted">(${esc(d.slug || shortId(d.id))})</span></label>
       </div>`).join('');
-    document.getElementById('act-dev-list').innerHTML = rows || '<div class="text-muted small">No matching devices.</div>';
+    const more = this._chooserMatches.length > shown.length ? `<div class="text-muted small mt-1">${this._chooserMatches.length - shown.length} more match(es) – refine the filter.</div>` : '';
+    document.getElementById('act-dev-list').innerHTML = (rows || '<div class="text-muted small">No matching devices.</div>') + more;
+    this._updateChooserCount();
+  }
+  _updateChooserCount() {
+    $('#act-dev-count').text(this._selectedCreateDevices.size ? `${this._selectedCreateDevices.size} selected` : '');
   }
   _selectVisibleCreateDevices(checked) {
-    document.querySelectorAll('#act-dev-list .act-dev-cb').forEach(cb => {
-      cb.checked = checked;
-      checked ? this._selectedCreateDevices.add(cb.dataset.id) : this._selectedCreateDevices.delete(cb.dataset.id);
-    });
+    (this._chooserMatches || []).forEach(d => (checked ? this._selectedCreateDevices.add(d.id) : this._selectedCreateDevices.delete(d.id)));
+    this._renderDeviceChooser();
   }
   async _createBulkActions() {
     const ids = [...this._selectedCreateDevices];
@@ -1139,6 +1192,20 @@ class DeviceDetailPanel {
     $('#detail-tabs a').removeClass('active'); $('#detail-tabs a[data-dtab="overview"]').addClass('active');
     this._oc.show();
     this._loadTab('overview');
+    this._refreshDevice(d.id);
+  }
+
+  // The list holds a light copy (no profile data, possibly stale) – load the current device.
+  async _refreshDevice(id) {
+    try {
+      const fresh = (await this._api.get(`/devices/${id}`, { with_profile: 1 })).body;
+      if (!fresh || this._device?.id !== id) return;
+      this._device = fresh;
+      if (this._state.deviceMap[id]) this._state.updateDevice(fresh);
+      document.getElementById('detail-title').textContent = fresh.name || fresh.slug;
+      delete this._cache.overview;
+      if ($('#detail-tabs a.active').data('dtab') === 'overview') this._loadTab('overview');
+    } catch { /* keep the list copy */ }
   }
 
   async _loadTab(tab) {
@@ -1179,7 +1246,7 @@ class DeviceDetailPanel {
     }).join('');
     const tagOpts = this._state.tags.map(t => `<option value="${t.id}">${esc(t.name)}</option>`).join('');
     const loc = d.location?.coordinates ? `${d.location.coordinates[1].toFixed(5)}, ${d.location.coordinates[0].toFixed(5)}` : '—';
-    const meta = d.meta && Object.keys(d.meta).length ? `<pre class="bg-light p-2 rounded small mb-0">${esc(JSON.stringify(d.meta,null,2))}</pre>` : '<span class="text-muted small">empty</span>';
+    const meta = d.meta && Object.keys(d.meta).length ? `<pre class="bg-body-tertiary p-2 rounded small mb-0">${esc(JSON.stringify(d.meta,null,2))}</pre>` : '<span class="text-muted small">empty</span>';
     const mandate = getMandateLabel(this._state, d.mandate_id);
     const profiles = Array.isArray(d.profile_data) && d.profile_data.length
       ? d.profile_data.map(entry => {
@@ -1282,7 +1349,7 @@ class DeviceDetailPanel {
     this._rCursor = r.retrieve_after_id || null;
     if (!items.length && !append) { document.getElementById('detail-content').innerHTML = '<p class="text-muted">No readings.</p>'; return; }
     const rows = items.map(rd => {
-      const vals = rd.data ? Object.entries(rd.data).slice(0,6).map(([k,v]) => `<span class="badge bg-light text-dark border me-1">${esc(k)}: ${esc(String(v))}</span>`).join('') : '—';
+      const vals = rd.data ? Object.entries(rd.data).slice(0,6).map(([k,v]) => `<span class="badge bg-body-tertiary text-body border me-1">${esc(k)}: ${esc(String(v))}</span>`).join('') : '—';
       return `<tr><td class="small">${fmtDate(rd.measured_at)}</td><td>${vals}</td></tr>`;
     }).join('');
     const more = this._rCursor ? `<button class="btn btn-sm btn-outline-secondary mt-2" id="rd-more">Load more</button>` : '';
@@ -1339,7 +1406,7 @@ class DeviceDetailPanel {
       const gws = NetAnalysis.extractGateways(p).sort((a, b) => (b.rssi ?? -999) - (a.rssi ?? -999));
       const sf = NetAnalysis.extractSf(p);
       return `<tr><td class="small">${fmtDate(p.transceived_at || p.inserted_at)}</td><td>${sf != null ? `SF${sf}` : '—'}</td>
-        <td class="small">${gws.map(g => `<span class="badge bg-light text-dark border me-1" title="${esc(g.id)}">${esc(res.gateways.find(x => (x.ids || []).includes(g.id) || x.key === g.id)?.name || g.id)}: ${fmtNum(g.rssi, 0)} / ${fmtNum(g.snr)}</span>`).join('') || '<span class="text-muted">no gateway data</span>'}</td></tr>`;
+        <td class="small">${gws.map(g => `<span class="badge bg-body-tertiary text-body border me-1" title="${esc(g.id)}">${esc(res.gateways.find(x => (x.ids || []).includes(g.id) || x.key === g.id)?.name || g.id)}: ${fmtNum(g.rssi, 0)} / ${fmtNum(g.snr)}</span>`).join('') || '<span class="text-muted">no gateway data</span>'}</td></tr>`;
     }).join('');
     const loadedGw = gatewayDevices.length ? '' : '<div class="small text-muted mb-2"><i class="bi bi-info-circle me-1"></i>Load devices (incl. gateways) in the Devices view to show gateway names and distances.</div>';
     el.innerHTML = `

@@ -220,9 +220,8 @@ class ApiClient {
     let lastError;
     for (let attempt = 0; attempt <= 3; attempt++) {
       // Respect the bucket-based rate limit (default 50 requests / 10 s per API key).
-      if (this._rlRemaining <= 2) { await sleep(Math.min(this._rlReset, 10000)); this._rlRemaining = 50; }
+      await this._throttle();
       let res;
-      this.requestCount = (this.requestCount || 0) + 1;
       try { res = await fetch(url, opts); }
       catch (e) {
         if (e instanceof TypeError) {
@@ -235,10 +234,7 @@ class ApiClient {
         }
         throw e;
       }
-      const rlRemaining = parseInt(res.headers.get('x-ratelimit-remaining'), 10);
-      const rlReset = parseInt(res.headers.get('x-ratelimit-reset'), 10);
-      this._rlRemaining = Number.isFinite(rlRemaining) ? rlRemaining : 50;
-      this._rlReset = Number.isFinite(rlReset) ? rlReset : 10000;
+      this._readRateLimit(res);
       if (res.status === 429) {
         if (attempt >= 3) { lastError = 'Rate limit exceeded after 3 retries'; break; }
         await sleep(Math.max(this._rlReset, 1000) * (attempt + 1));
@@ -259,6 +255,85 @@ class ApiClient {
     }
     if (this._logger) this._logger.log(method, url, path, 0, Date.now() - startTime, lastError);
     throw new Error(lastError);
+  }
+
+  // Reserves a slot in the rate-limit bucket before sending, so concurrent workers do not all
+  // see the same "remaining" value and overshoot into 429 responses.
+  async _throttle() {
+    while (this._rlRemaining <= 2) {
+      await sleep(Math.min(Math.max(this._rlReset, 250), 10000));
+      if (this._rlRemaining <= 2) this._rlRemaining = 50;
+    }
+    this._rlRemaining--;
+    this.requestCount = (this.requestCount || 0) + 1;
+  }
+
+  _readRateLimit(res) {
+    const rlRemaining = parseInt(res.headers.get('x-ratelimit-remaining'), 10);
+    const rlReset = parseInt(res.headers.get('x-ratelimit-reset'), 10);
+    this._rlRemaining = Number.isFinite(rlRemaining) ? rlRemaining : 50;
+    this._rlReset = Number.isFinite(rlReset) ? rlReset : 10000;
+  }
+
+  /**
+   * Streaming variant of a list endpoint (…/stream): ELEMENT sends one JSON document per line,
+   * so a whole folder's packets arrive in a single request. onItem(obj) is called per document;
+   * returning false (or shouldStop() becoming true) aborts the transfer. Returns the item count.
+   */
+  async stream(path, params, onItem, { shouldStop = null } = {}) {
+    const startTime = Date.now();
+    const url = this._buildUrl(path, params);
+    await this._throttle();
+    const ctrl = new AbortController();
+    let res;
+    try { res = await fetch(url, { headers: { Accept: 'application/x-ndjson, application/json' }, signal: ctrl.signal }); }
+    catch (e) {
+      const msg = `Network/CORS error: ${e.message}`;
+      if (this._logger) this._logger.log('GET', url, path, 0, Date.now() - startTime, msg);
+      throw new Error(msg);
+    }
+    this._readRateLimit(res);
+    if (!res.ok || !res.body) {
+      let msg = res.statusText;
+      try { msg = (await res.text()).slice(0, 200) || msg; } catch { /* ignore */ }
+      const err = `HTTP ${res.status}: ${msg}`;
+      if (this._logger) this._logger.log('GET', url, path, res.status, Date.now() - startTime, err);
+      throw new Error(err);
+    }
+    const reader = res.body.getReader();
+    const dec = new TextDecoder();
+    let buf = '', n = 0, stopped = false;
+    const handle = line => {
+      const t = line.trim();
+      if (!t) return true;
+      let obj;
+      try { obj = JSON.parse(t); } catch { return true; }
+      // Tolerate a plain JSON list response ({ body: [...] }) as well.
+      const items = obj && Array.isArray(obj.body) && !('id' in obj) ? obj.body : [obj];
+      for (const it of items) {
+        n++;
+        if (onItem(it) === false || (shouldStop && shouldStop())) return false;
+      }
+      return true;
+    };
+    try {
+      outer: while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += dec.decode(value, { stream: true });
+        let idx;
+        while ((idx = buf.indexOf('\n')) >= 0) {
+          const line = buf.slice(0, idx);
+          buf = buf.slice(idx + 1);
+          if (!handle(line)) { stopped = true; break outer; }
+        }
+      }
+      if (!stopped) handle(buf + dec.decode());
+    } finally {
+      if (stopped) { try { ctrl.abort(); } catch { /* ignore */ } }
+    }
+    if (this._logger) this._logger.log('GET', url, `${path} (${n} items${stopped ? ', stopped' : ''})`, res.status, Date.now() - startTime, null);
+    return n;
   }
 
   /**

@@ -8,6 +8,15 @@
   <link rel="stylesheet" href="vendor/bootstrap-icons.min.css">
   <link rel="stylesheet" href="vendor/leaflet/leaflet.css">
   <link rel="stylesheet" href="css/styles.css">
+  <script>
+    // Apply the saved theme before first paint (light / dark / auto = follow the OS).
+    (function () {
+      var t = 'auto';
+      try { t = localStorage.getItem('elmoTheme') || 'auto'; } catch (e) {}
+      var dark = t === 'dark' || (t === 'auto' && window.matchMedia && matchMedia('(prefers-color-scheme: dark)').matches);
+      document.documentElement.setAttribute('data-bs-theme', dark ? 'dark' : 'light');
+    })();
+  </script>
 </head>
 <body>
   <div id="loading-bar"></div>
@@ -39,6 +48,9 @@
 
       <!-- Configuration -->
       <a href="#" class="nav-link" data-view="config"><i class="bi bi-gear-fill sidebar-nav-icon"></i> <span class="lbl">Configuration</span></a>
+
+      <!-- Theme -->
+      <button type="button" class="theme-toggle" id="theme-toggle" title="Theme: light / dark / follow system"><i class="bi bi-circle-half sidebar-nav-icon"></i> <span class="lbl" id="theme-label">Theme: auto</span></button>
 
       <!-- Legal -->
       <a href="LEGAL.html" class="nav-link"><i class="bi bi-file-earmark-text sidebar-nav-icon"></i> <span class="lbl">Legal</span></a>
@@ -289,7 +301,7 @@
         <div class="card mb-3">
           <div class="card-body py-2">
             <div class="row g-2 align-items-end">
-              <div class="col-md-4">
+              <div class="col-md-3">
                 <label class="form-label small mb-1">Search</label>
                 <div class="input-group input-group-sm">
                   <input type="text" class="form-control" id="dev-filter-name" placeholder="name, slug, ID or EUI…">
@@ -307,6 +319,17 @@
               <div class="col-md-2">
                 <label class="form-label small mb-1">Folder</label>
                 <div id="dev-filter-folder"></div>
+              </div>
+              <div class="col-md-1">
+                <label class="form-label small mb-1" for="dev-filter-activity">Activity</label>
+                <select class="form-select form-select-sm" id="dev-filter-activity" title="Based on the last uplink in ELEMENT's device statistics">
+                  <option value="">Any</option>
+                  <option value="24h">Uplink &lt; 24 h</option>
+                  <option value="7d">Uplink &lt; 7 d</option>
+                  <option value="silent1">Silent &gt; 24 h</option>
+                  <option value="silent7">Silent &gt; 7 d</option>
+                  <option value="never">Never sent</option>
+                </select>
               </div>
               <div class="col-md-1">
                 <label class="form-label small mb-1">Location</label>
@@ -379,7 +402,8 @@
                   <th class="sortable d-none d-md-table-cell" data-col="slug">Slug</th>
                   <th class="sortable" data-col="type">Type</th>
                   <th>Folders</th>
-                  <th class="sortable d-none d-lg-table-cell" data-col="inserted_at">Created</th>
+                  <th class="sortable d-none d-lg-table-cell" data-col="last_uplink" title="Last uplink according to ELEMENT statistics">Last uplink</th>
+                  <th class="sortable d-none d-xl-table-cell" data-col="inserted_at">Created</th>
                   <th>Mandate</th>
                   <th class="th-actions"><span class="visually-hidden">Actions</span></th>
                 </tr>
@@ -447,7 +471,7 @@
         </div>
         <div id="folders-table-wrap" class="card d-none">
           <table class="table table-hover table-sm mb-0">
-            <thead><tr><th>Name</th><th>Color</th><th>Slug</th><th>Created</th><th>Mandate</th><th></th></tr></thead>
+            <thead><tr><th>Name</th><th>Color</th><th class="text-end" title="Devices directly in this folder (from the loaded device list)">Devices</th><th>Slug</th><th>Created</th><th>Mandate</th><th></th></tr></thead>
             <tbody id="folders-tbody"></tbody>
           </table>
         </div>
@@ -551,8 +575,9 @@
                   <label class="form-label">Devices</label>
                   <input type="text" class="form-control form-control-sm mb-2" id="act-dev-search" placeholder="Filter devices…">
                   <div class="d-flex gap-2 mb-2">
-                    <button type="button" class="btn btn-sm btn-outline-secondary" id="act-dev-all">Select all</button>
+                    <button type="button" class="btn btn-sm btn-outline-secondary" id="act-dev-all">Select all matches</button>
                     <button type="button" class="btn btn-sm btn-outline-secondary" id="act-dev-clear">Clear</button>
+                    <span class="small text-muted align-self-center ms-auto" id="act-dev-count"></span>
                   </div>
                   <div class="border rounded p-2" id="act-dev-list"></div>
                 </div>
@@ -705,14 +730,25 @@
                 </select>
               </div>
               <div class="col-md-2">
-                <label class="form-label small mb-1" for="net-scope-packets" title="Uplinks analysed per device (newest first)">Packets / device</label>
+                <label class="form-label small mb-1" for="net-pk-strategy" title="How uplinks are loaded">Packet loading</label>
+                <select class="form-select form-select-sm" id="net-pk-strategy">
+                  <option value="auto" selected>Folder streams + per device</option>
+                  <option value="device">Per device only</option>
+                </select>
+              </div>
+              <div class="col-md-1">
+                <label class="form-label small mb-1" for="net-scope-packets" title="Uplinks analysed per device (newest first)">Pkt / dev.</label>
                 <input type="number" class="form-control form-control-sm" id="net-scope-packets" value="20" min="1" max="100">
               </div>
-              <div class="col-md-2">
-                <label class="form-label small mb-1" for="net-scope-maxdev">Max devices</label>
-                <input type="number" class="form-control form-control-sm" id="net-scope-maxdev" value="2000" min="10" max="20000">
+              <div class="col-md-1">
+                <label class="form-label small mb-1" for="net-scope-maxdev">Max dev.</label>
+                <input type="number" class="form-control form-control-sm" id="net-scope-maxdev" value="10000" min="10" max="50000">
               </div>
-              <div class="col-md-3 d-flex gap-2 align-items-end">
+              <div class="col-md-3 d-flex gap-2 align-items-end flex-wrap">
+                <div class="form-check mb-1 me-1">
+                  <input class="form-check-input" type="checkbox" id="net-use-cache" checked>
+                  <label class="form-check-label small" for="net-use-cache" title="Reuse packets and the Devices view's device list loaded within the last 15 minutes">Use cache</label>
+                </div>
                 <div class="form-check mb-1 me-1">
                   <input class="form-check-input" type="checkbox" id="net-scope-uplinks" checked>
                   <label class="form-check-label small" for="net-scope-uplinks" title="Only request packets with packet_type=up">Uplinks only</label>
@@ -723,7 +759,7 @@
             </div>
             <div class="small text-muted mt-2" id="net-progress">
               Scopes are applied as API filters where possible (mandate, folder, name, gateway interface) to keep the number of requests low.
-              In <em>Gateway links</em> mode one request per device is needed; devices whose last uplink (ELEMENT statistics) is older than the time window are rated silent without a request.
+              In <em>Gateway links</em> mode uplinks are streamed per folder (one request per folder, window chosen from ELEMENT's packet intervals); only devices that deliver too few packets that way are loaded individually. Devices whose last uplink (ELEMENT statistics) is older than the time window are rated silent without a request.
               <em>Quick</em> mode uses only ELEMENT's device statistics: no packet requests, but no per-gateway links and no reception estimate.
             </div>
           </div>
@@ -1018,7 +1054,7 @@
             </div>
           </div>
           <div class="col-12">
-            <div id="bpe-fields" class="border rounded p-3 bg-light">
+            <div id="bpe-fields" class="border rounded p-3 bg-body-tertiary">
               <div class="text-muted small">Select a profile to edit its fields.</div>
             </div>
           </div>

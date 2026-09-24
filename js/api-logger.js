@@ -4,6 +4,7 @@ class ApiLogger {
   constructor(maxEntries = 500) {
     this.maxEntries = maxEntries;
     this.logs = this._load();
+    if (typeof window !== 'undefined') window.addEventListener('pagehide', () => this._saveNow());
   }
 
   _load() {
@@ -15,7 +16,14 @@ class ApiLogger {
     }
   }
 
+  // Persisting is debounced: serialising up to 10 000 entries on every request made large
+  // analyses (thousands of requests) noticeably slower.
   _save() {
+    clearTimeout(this._saveTimer);
+    this._saveTimer = setTimeout(() => this._saveNow(), 2000);
+  }
+
+  _saveNow() {
     try {
       localStorage.setItem('deviceAdminApiLog', JSON.stringify(this.logs));
     } catch (e) {
@@ -50,9 +58,8 @@ class ApiLogger {
       timestamp: new Date().toISOString()
     };
     this.logs.unshift(entry);
-    if (this.logs.length > this.maxEntries) {
-      this.logs = this.logs.slice(0, this.maxEntries);
-    }
+    if (this.logs.length > this.maxEntries) this.logs.length = this.maxEntries;
+    if (this.onChange) this.onChange();
     this._save();
     return entry;
   }
@@ -63,7 +70,7 @@ class ApiLogger {
 
   clear() {
     this.logs = [];
-    this._save();
+    this._saveNow();
   }
 
   setMaxEntries(n) {
