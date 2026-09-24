@@ -92,7 +92,7 @@ class NetworkView {
       this._statusFilter.has(s) ? this._statusFilter.delete(s) : this._statusFilter.add(s);
       this._renderStatusFilters(); this._renderAll();
     });
-    $('#net-l-gw, #net-l-dev, #net-l-links, #net-l-range').on('change', () => this._renderMap());
+    $('#net-l-gw, #net-l-dev, #net-l-links, #net-l-range, #net-l-est').on('change', () => this._renderMap());
     $('#net-l-grid, #net-l-covered').on('change', () => this._renderMap());
     $('#net-grid-size').on('change', () => this._updateCoverage());
     $('#net-area').on('change', () => {
@@ -602,6 +602,7 @@ class NetworkView {
 
   _recompute(fit = false) {
     this._result = NetAnalysis.analyze({ ...this._raw, thresholds: this._thresholds() });
+    this._estInfo = NetAnalysis.estimateLocations(this._result);
     this._devById = new Map(this._result.devices.map(d => [d.id, d]));
     this._gwByKey = new Map(this._result.gateways.map(g => [g.key, g]));
     this._computeCoverage();
@@ -733,7 +734,8 @@ class NetworkView {
   }
 
   _renderLegend() {
-    const dev = Object.values(NET_STATUS).map(s => `<span><span class="net-dot" style="--c:${s.color}"></span>${esc(s.label)}</span>`).join('');
+    const dev = Object.values(NET_STATUS).map(s => `<span><span class="net-dot" style="--c:${s.color}"></span>${esc(s.label)}</span>`).join('')
+      + '<span><span class="net-dot net-dot-est" style="--c:#868e96"></span>Estimated position</span>';
     const gw = Object.entries(NET_GW_STATUS).map(([k, s]) => `<span><span class="net-gw-legend net-gw-${k}"><i class="bi bi-broadcast-pin"></i></span>${esc(s.label)}</span>`).join(' ');
     $('#net-legend').html(`${dev}<span class="ms-2">Gateways: ${gw}</span>
       <span class="ms-2">Links: <span class="net-line" style="--c:${NET_LINK_COLOR.good}"></span>good <span class="net-line" style="--c:${NET_LINK_COLOR.ok}"></span>fair <span class="net-line" style="--c:${NET_LINK_COLOR.weak}"></span>weak</span>
@@ -747,7 +749,7 @@ class NetworkView {
       `<div class="col-6 col-md-4 col-xl"><div class="card net-tile h-100" style="--c:${color || '#adb5bd'}" title="${esc(title)}"><div class="card-body py-2">
         <div class="small text-muted">${esc(label)}</div><div class="fs-5 fw-semibold">${value}</div></div></div></div>`;
     $('#net-tiles').html([
-      tile('Devices', `${s.devices}<small class="text-muted fs-6 fw-normal"> · ${s.located} on map</small>`, null, 'Devices without location are only listed in the table'),
+      tile('Devices', `${s.devices}<small class="text-muted fs-6 fw-normal"> · ${s.located} located${this._estInfo?.placed ? ` · ${this._estInfo.placed} est.` : ''}</small>`, null, 'Located = position stored in ELEMENT; est. = position estimated from receiving gateways'),
       tile('Gateways', `${s.gatewaysActive}<small class="text-muted fs-6 fw-normal"> / ${s.gateways} receiving${s.gatewaysOffline ? ` · <span class="text-danger">${s.gatewaysOffline} offline</span>` : ''}</small>`, '#1c7ed6', `${s.gatewaysIdle} gateway(s) received none of the analysed devices; ${s.gatewaysForeign} gateway(s) are not visible to this API key; offline = no packet-forwarder ping for over 1 h`),
       tile('Good', `${c.good}${pct(c.good)}`, NET_STATUS.good.color),
       tile('Single gateway', `${c.single}${pct(c.single)}`, NET_STATUS.single.color, 'No redundancy – a single gateway outage makes these devices silent'),
@@ -760,7 +762,11 @@ class NetworkView {
     const warns = [...(this._warnings || [])];
     if (s.noGwInfo) warns.push('None of the loaded packets contained gateway statistics. ELEMENT LNS attaches them to LoRaWAN uplinks – if you see this for LNS devices, please report it (the packet format may have changed).');
     const noLoc = s.devices - s.located;
-    if (noLoc) warns.push(`${noLoc} device(s) have no location and are not shown on the map.`);
+    if (noLoc) {
+      const ei = this._estInfo || { placed: 0, single: 0 };
+      const rest = noLoc - ei.placed - ei.single;
+      warns.push(`${noLoc} device(s) have no location in ELEMENT: ${ei.placed} placed at an <em>estimated</em> position from their gateways (hollow markers, excluded from the reception model)${ei.single ? `, ${ei.single} received by only one located gateway (not placed)` : ''}${rest > 0 ? `, ${rest} without usable gateway data (silent or rated from statistics)` : ''}.`);
+    }
     const gwNoLoc = this._result.gateways.filter(g => !g.latlng && g.packets).length;
     if (gwNoLoc) warns.push(`${gwNoLoc} active gateway(s) have no known location – links to them cannot be drawn.`);
     $('#net-warning').toggleClass('d-none', !warns.length).html(warns.map(w => `<div><i class="bi bi-exclamation-triangle me-1"></i>${w}</div>`).join(''));
@@ -785,6 +791,7 @@ class NetworkView {
   _renderMap() {
     if (!this._map || !this._result) return;
     const L_ = this._layers;
+    this._showEst = $('#net-l-est').prop('checked');
     ['grid', 'range', 'linksAll', 'dev', 'gw'].forEach(k => L_[k].clearLayers());
     const { devices, gateways } = this._vis;
 
@@ -807,7 +814,7 @@ class NetworkView {
         for (const link of st.links.values()) {
           if (!this._vis.gwKeys.has(link.gw.key)) continue;
           if (n++ >= NET_MAX_LINKS) break;
-          this._drawLink(st.latlng, link, L_.linksAll);
+          this._drawLink(this._pos(st), link, L_.linksAll);
         }
         if (n >= NET_MAX_LINKS) break;
       }
@@ -816,10 +823,14 @@ class NetworkView {
     // Tooltips are built lazily (function content) – thousands of markers stay cheap.
     if ($('#net-l-dev').prop('checked')) {
       devices.forEach(st => {
-        if (!st.latlng) return;
-        L.circleMarker(st.latlng, {
-          renderer: this._renderer, radius: 6, color: '#fff', weight: 1.5, fillColor: NET_STATUS[st.status].color, fillOpacity: 0.95,
-        }).bindTooltip(() => `<strong>${esc(st.name)}</strong><br>${esc(NET_STATUS[st.status].label)} · ${st.source === 'stats' ? 'ELEMENT statistics' : `${st.gwCount} gateway(s) · ${st.packets} pkt`}`)
+        const pos = this._pos(st);
+        if (!pos) return;
+        // Estimated positions: hollow marker with dashed outline.
+        const est = !st.latlng;
+        L.circleMarker(pos, est
+          ? { renderer: this._renderer, radius: 5, color: NET_STATUS[st.status].color, weight: 2, dashArray: '2 2', fillColor: NET_STATUS[st.status].color, fillOpacity: 0.25 }
+          : { renderer: this._renderer, radius: 6, color: '#fff', weight: 1.5, fillColor: NET_STATUS[st.status].color, fillOpacity: 0.95 },
+        ).bindTooltip(() => `<strong>${esc(st.name)}</strong><br>${esc(NET_STATUS[st.status].label)} · ${st.source === 'stats' ? 'ELEMENT statistics' : `${st.gwCount} gateway(s) · ${st.packets} pkt`}${est ? `<br><em>Estimated position ±${fmtDistance(st.est.radius)}</em>` : ''}`)
           .on('click', () => this._select({ kind: 'device', id: st.id }))
           .addTo(L_.dev);
       });
@@ -835,6 +846,12 @@ class NetworkView {
       });
     }
     this._renderSelectionLayers();
+  }
+
+  // Map position of a device: its real location, or (if enabled) the estimate from its gateways.
+  _pos(st) {
+    if (st.latlng) return st.latlng;
+    return st.est && this._showEst ? st.est.latlng : null;
   }
 
   _drawLink(devLatLng, link, layer) {
@@ -858,21 +875,29 @@ class NetworkView {
       return;
     }
     if ($('#net-l-links').val() === 'selected') {
-      if (sel.kind === 'device') r.links.forEach(link => this._drawLink(r.latlng, link, L_.links));
+      if (sel.kind === 'device') r.links.forEach(link => this._drawLink(this._pos(r), link, L_.links));
       else r.devices.forEach((_, devId) => {
         const st = this._devById.get(devId);
         const link = st?.links.get(r.key);
-        if (link) this._drawLink(st.latlng, link, L_.links);
+        if (link) this._drawLink(this._pos(st), link, L_.links);
       });
     }
-    if (r.latlng) {
-      L.circleMarker(r.latlng, { radius: sel.kind === 'gw' ? 19 : 11, color: sel.kind === 'gw' ? '#fab005' : '#1971c2', weight: 3, fill: false, interactive: false }).addTo(L_.hl);
+    const pos = sel.kind === 'device' ? this._pos(r) : r.latlng;
+    if (pos) {
+      L.circleMarker(pos, { radius: sel.kind === 'gw' ? 19 : 11, color: sel.kind === 'gw' ? '#fab005' : '#1971c2', weight: 3, fill: false, interactive: false }).addTo(L_.hl);
+    }
+    // Uncertainty of an estimated position; ring of possible positions for single-gateway devices.
+    if (sel.kind === 'device' && !r.latlng && r.est && this._showEst) {
+      L.circle(r.est.latlng, { renderer: this._renderer, radius: r.est.radius, color: '#1971c2', weight: 1.5, dashArray: '5 4', fillOpacity: 0.08, interactive: false }).addTo(L_.hl);
+    }
+    if (sel.kind === 'device' && !r.latlng && r.estSingleGw?.gw?.latlng) {
+      L.circle(r.estSingleGw.gw.latlng, { renderer: this._renderer, radius: r.estSingleGw.distance, color: '#1971c2', weight: 1.5, dashArray: '5 4', fill: false, interactive: false }).addTo(L_.hl);
     }
   }
 
   _fit() {
     if (!this._map || !this._vis) return;
-    const pts = [...this._vis.devices.filter(d => d.latlng).map(d => d.latlng), ...this._vis.gateways.filter(g => g.latlng).map(g => g.latlng)];
+    const pts = [...this._vis.devices.map(d => this._pos(d)).filter(Boolean), ...this._vis.gateways.filter(g => g.latlng).map(g => g.latlng)];
     if (pts.length) this._map.fitBounds(L.latLngBounds(pts), { padding: [30, 30], maxZoom: 16 });
   }
 
@@ -902,11 +927,11 @@ class NetworkView {
     if (this._selection.kind === 'area') { this._map.fitBounds(r.bounds, { padding: [60, 60], maxZoom: 17 }); return; }
     const pts = [];
     if (this._selection.kind === 'device') {
-      if (r.latlng) pts.push(r.latlng);
+      if (this._pos(r)) pts.push(this._pos(r));
       r.links.forEach(l => l.gw.latlng && pts.push(l.gw.latlng));
     } else {
       if (r.latlng) pts.push(r.latlng);
-      r.devices.forEach((_, id) => { const st = this._devById.get(id); if (st?.latlng) pts.push(st.latlng); });
+      r.devices.forEach((_, id) => { const st = this._devById.get(id); const p = st && this._pos(st); if (p) pts.push(p); });
     }
     if (pts.length === 1) this._map.setView(pts[0], Math.max(this._map.getZoom(), 14));
     else if (pts.length) this._map.fitBounds(L.latLngBounds(pts), { padding: [40, 40], maxZoom: 16 });
@@ -943,7 +968,11 @@ class NetworkView {
         <dt class="col-6">Gateways / packet</dt><dd class="col-6">${fmtNum(st.gwAvg)}</dd>
         <dt class="col-6">Avg. spreading factor</dt><dd class="col-6">${st.sfAvg != null ? `SF${fmtNum(st.sfAvg)}` : '—'}</dd>
         <dt class="col-6">Nearest gateway</dt><dd class="col-6">${st.nearestGw ? `${fmtDistance(st.nearestGwDistance)} <small class="text-muted">(${esc(netGwLabel(st.nearestGw))})</small>` : '—'}</dd>
-        ${st.latlng ? '' : '<dt class="col-12 text-warning fw-normal">Device has no location.</dt>'}
+        ${st.latlng ? '' : st.est
+          ? `<dt class="col-12 fw-normal text-info-emphasis"><i class="bi bi-crosshair me-1"></i>No location in ELEMENT – position estimated from ${st.est.gateways} gateways (±${fmtDistance(st.est.radius)}).</dt>`
+          : st.estSingleGw?.gw
+            ? `<dt class="col-12 fw-normal text-warning-emphasis">No location – only one located gateway (${esc(netGwLabel(st.estSingleGw.gw))}) receives it, roughly ${fmtDistance(st.estSingleGw.distance)} away (dashed ring).</dt>`
+            : '<dt class="col-12 text-warning fw-normal">Device has no location.</dt>'}
       </dl>
       ${st.elementStats ? `<div class="small text-muted mb-1">ELEMENT statistics</div><dl class="row mb-2 net-dl">
         <dt class="col-6">Avg. RSSI / SNR</dt><dd class="col-6">${fmtNum(st.elementStats.rssiAvg, 0)} dBm / ${fmtNum(st.elementStats.snrAvg)} dB</dd>
@@ -1031,7 +1060,7 @@ class NetworkView {
     const statusOrder = { silent: 0, weak: 1, single: 2, unknown: 3, good: 4 };
     const ratingOrder = { hole: 0, marginal: 1, unknown: 2, good: 3 };
     if (this._tab === 'devices') return [
-      { key: 'name', label: 'Device', val: s => (s.name || '').toLowerCase(), html: s => esc(s.name) + (s.latlng ? '' : ' <i class="bi bi-geo-alt text-muted opacity-50" title="No location"></i>') },
+      { key: 'name', label: 'Device', val: s => (s.name || '').toLowerCase(), html: s => esc(s.name) + (s.latlng ? '' : s.est ? ` <i class="bi bi-crosshair text-info" title="Position estimated from ${s.est.gateways} gateways (±${fmtDistance(s.est.radius)})"></i>` : ' <i class="bi bi-geo-alt text-muted opacity-50" title="No location"></i>') },
       { key: 'status', label: 'Status', val: s => statusOrder[s.status], html: s => netStatusBadge(s.status) + (s.source === 'stats' ? ' <i class="bi bi-bar-chart-line text-muted" title="Rated from ELEMENT device statistics (no packets loaded)"></i>' : '') },
       { key: 'packets', label: 'Pkt', num: true, val: s => s.packets, html: s => s.packets },
       { key: 'gws', label: 'Gateways', num: true, val: s => (s.source === 'stats' ? s.gwAvg ?? -1 : s.gwCount), html: s => (s.source === 'stats' ? (s.gwAvg != null && s.status !== 'silent' ? `<span title="Average receiving gateways (ELEMENT statistics)">⌀ ${fmtNum(s.gwAvg)}</span>` : '—') : s.gwCount) },
@@ -1104,8 +1133,8 @@ class NetworkView {
 
   _exportDevices() {
     if (!this._result) return;
-    const rows = [['device_id', 'name', 'slug', 'mandate_id', 'source', 'status', 'latitude', 'longitude', 'packets', 'packets_with_gateway_data', 'gateways', 'gateways_per_packet', 'best_gateway', 'best_rssi_avg', 'best_snr_avg', 'best_margin', 'sf_avg', 'nearest_gateway', 'nearest_gateway_m', 'last_uplink']];
-    this._vis.devices.forEach(s => rows.push([s.id, s.name, s.device.slug, s.device.mandate_id, s.source, s.status, s.latlng?.[0], s.latlng?.[1], s.packets, s.withGwInfo, s.gwCount, s.gwAvg?.toFixed(2),
+    const rows = [['device_id', 'name', 'slug', 'mandate_id', 'source', 'status', 'latitude', 'longitude', 'est_latitude', 'est_longitude', 'est_radius_m', 'packets', 'packets_with_gateway_data', 'gateways', 'gateways_per_packet', 'best_gateway', 'best_rssi_avg', 'best_snr_avg', 'best_margin', 'sf_avg', 'nearest_gateway', 'nearest_gateway_m', 'last_uplink']];
+    this._vis.devices.forEach(s => rows.push([s.id, s.name, s.device.slug, s.device.mandate_id, s.source, s.status, s.latlng?.[0], s.latlng?.[1], s.est?.latlng[0]?.toFixed(6), s.est?.latlng[1]?.toFixed(6), s.est?.radius?.toFixed(0), s.packets, s.withGwInfo, s.gwCount, s.gwAvg?.toFixed(2),
       s.best ? netGwLabel(s.best.gw) : '', s.summary?.rssiAvg?.toFixed(1), s.summary?.snrAvg?.toFixed(1), s.summary?.margin?.toFixed(1), s.sfAvg?.toFixed(1),
       s.nearestGw ? netGwLabel(s.nearestGw) : '', s.nearestGwDistance?.toFixed(0), s.lastSeen]));
     downloadFile(`elmo-network-devices-${this._fileStamp()}.csv`, toCsv(rows), 'text/csv');

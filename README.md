@@ -65,6 +65,7 @@ Built for LoRaWAN devices on the **ELEMENT LNS** driver. The **Network** view lo
   3. Where devices exist, their measured rating overrides the prediction.
   4. Contiguous no-reception cells form **areas**, listed by size with the devices affected, the nearest receiving gateway and the basis (*estimate*, *model + devices*, or *measured* – devices are silent/weak although the model predicts reception, which often points to the device rather than coverage).
   The model knows nothing about terrain or buildings beyond what the fit captures; the scatter of the fit (± dB) is shown under the table. Treat areas without devices as an estimate.
+- **Estimated positions**: devices without a location in ELEMENT are placed from the distances implied by their RSSI (fitted path-loss model) to two or more located gateways – weighted multilateration, shown as hollow markers with a ± radius on selection. Devices heard by only one located gateway are not placed (a dashed ring shows the likely distance). Estimates are display-only and never feed the reception model. Can be switched off on the map.
 - **Gateways table** shows how many devices depend on each gateway alone ("Only GW for").
 - Requests are throttled to Element's rate limit (default 50 requests / 10 s), so an analysis costs roughly one request per device.
 

@@ -532,6 +532,64 @@ const NetAnalysis = (() => {
    * Classes: covered (≥2 gateways), single (1 gateway), marginal (best link within the fade
    * margin of the weak threshold), none (no reception expected / observed).
    */
+  /**
+   * Estimates positions of devices without a location from the gateways that received them:
+   * each link's RSSI is turned into a distance with the fitted path-loss model and the device is
+   * placed at the centroid of its located gateways weighted by 1/distance². Needs at least two
+   * located gateways – with one, the device could be anywhere on a ring around it.
+   * Estimates are for display only; they never feed the model, grid or ranges.
+   * Sets st.est = { latlng, radius, gateways } and st.estSingleGw for single-gateway devices.
+   */
+  function estimateLocations(result, model = fitPathLoss(result)) {
+    let placed = 0, single = 0;
+    result.devices.forEach(st => {
+      st.est = null; st.estSingleGw = null;
+      if (st.latlng) return;
+      const pts = [];
+      st.links.forEach(l => {
+        if (!l.gw.latlng || l.rssiAvg == null) return;
+        const m = model.perGw.get(l.gw.key) || model.global;
+        const d = Math.min(30000, Math.max(50, 1000 * 10 ** ((m.r1k - l.rssiAvg) / (10 * m.n))));
+        pts.push({ ll: l.gw.latlng, d, w: 1 / (d * d) });
+      });
+      if (pts.length === 1) { st.estSingleGw = { gw: [...st.links.values()].find(l => l.gw.latlng)?.gw || null, distance: pts[0].d }; single++; return; }
+      if (pts.length < 2) return;
+      const W = pts.reduce((a, p) => a + p.w, 0);
+      let latlng = [pts.reduce((a, p) => a + p.w * p.ll[0], 0) / W, pts.reduce((a, p) => a + p.w * p.ll[1], 0) / W];
+      // With 3+ gateways refine by weighted least squares on the range residuals (local metres,
+      // relative-error weights, damped Gauss-Newton). Two gateways leave a mirror ambiguity –
+      // the centroid is kept there.
+      if (pts.length >= 3) {
+        const kx = 111320 * Math.cos(latlng[0] * Math.PI / 180), ky = 111320;
+        const P = pts.map(p => ({ x: (p.ll[1] - latlng[1]) * kx, y: (p.ll[0] - latlng[0]) * ky, d: p.d, w: p.w }));
+        let x = 0, y = 0;
+        for (let it = 0; it < 15; it++) {
+          let a11 = 0, a12 = 0, a22 = 0, b1 = 0, b2 = 0;
+          P.forEach(q => {
+            const dx = x - q.x, dy = y - q.y, r = Math.max(Math.hypot(dx, dy), 1);
+            const jx = dx / r, jy = dy / r, e = r - q.d;
+            a11 += q.w * jx * jx; a12 += q.w * jx * jy; a22 += q.w * jy * jy; b1 += q.w * jx * e; b2 += q.w * jy * e;
+          });
+          const lam = 1e-3 * (a11 + a22), det = (a11 + lam) * (a22 + lam) - a12 * a12;
+          if (!det) break;
+          const sx = ((a22 + lam) * b1 - a12 * b2) / det, sy = ((a11 + lam) * b2 - a12 * b1) / det;
+          x -= 0.7 * sx; y -= 0.7 * sy;
+          if (Math.hypot(sx, sy) < 5) break;
+        }
+        // Keep the refinement inside the gateways' hull neighbourhood; otherwise use the centroid.
+        const maxD = Math.max(...pts.map(p => p.d));
+        if (Math.hypot(x, y) <= maxD) latlng = [latlng[0] + y / ky, latlng[1] + x / kx];
+      }
+      const res = Math.sqrt(pts.reduce((a, p) => a + p.w * (haversine(latlng, p.ll) - p.d) ** 2, 0) / W);
+      // Stated accuracy: residual spread, but never tighter than a third of the nearest range
+      // (RSSI-derived distances scatter by tens of percent).
+      const minD = Math.min(...pts.map(p => p.d));
+      st.est = { latlng, radius: Math.min(20000, Math.max(200, res, minD / 3)), gateways: pts.length };
+      placed++;
+    });
+    return { placed, single };
+  }
+
   // Distance from the nearest gateway to a lat/lng rectangle (0 when inside).
   function rectDistance([[s, w], [n, e]], gws) {
     let mn = Infinity;
@@ -697,7 +755,7 @@ const NetAnalysis = (() => {
   return {
     SF_SNR_FLOOR, normalizeGwId, extractGateways, extractSf, linkMargin, gatewayIdsFromDevice,
     deviceLatLng, haversine, percentile, analyze, fitPathLoss, estimateCoverage, isEuiLike,
-    isGatewayDevice, isLnsInterface, gatewayLastPing, statsSummary, routerIdFromEntry, compactPacket, packetIntervalSecs, tsMs,
+    isGatewayDevice, isLnsInterface, estimateLocations, gatewayLastPing, statsSummary, routerIdFromEntry, compactPacket, packetIntervalSecs, tsMs,
   };
 })();
 

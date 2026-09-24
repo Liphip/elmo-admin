@@ -115,3 +115,4 @@ th.sortable:hover { background: var(--bs-secondary-bg) !important; }
 .theme-toggle:hover { color: #fff; background: rgba(255,255,255,.08); }
 #sidebar.collapsed .theme-toggle .lbl { opacity: 0; pointer-events: none; }
 .net-side td { white-space: nowrap; }
+.net-dot-est { background: color-mix(in srgb, var(--c) 25%, transparent); border: 2px dashed var(--c); }

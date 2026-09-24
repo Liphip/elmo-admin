@@ -781,7 +781,7 @@
               <div class="card h-100">
                 <div class="card-header py-2">
                   <div class="d-flex flex-wrap gap-2 align-items-center small">
-                    <span class="net-scope-label me-1" style="width:70px">Devices</span>
+                    <span class="net-scope-label me-1" style="min-width:80px">Devices</span>
                     <div class="input-group input-group-sm net-search">
                       <span class="input-group-text"><i class="bi bi-search"></i></span>
                       <input type="text" class="form-control" id="net-filter-q" placeholder="Name, slug or EUI…" aria-label="Filter devices">
@@ -789,7 +789,7 @@
                     <div class="d-flex flex-wrap gap-2" id="net-status-filters"></div>
                   </div>
                   <div class="d-flex flex-wrap gap-2 align-items-center small mt-2">
-                    <span class="net-scope-label me-1" style="width:70px">Gateways</span>
+                    <span class="net-scope-label me-1" style="min-width:80px">Gateways</span>
                     <div class="input-group input-group-sm net-search">
                       <span class="input-group-text"><i class="bi bi-search"></i></span>
                       <input type="text" class="form-control" id="net-filter-gw" placeholder="Name or EUI…" aria-label="Filter gateways">
@@ -800,6 +800,7 @@
                   <div class="d-flex flex-wrap gap-3 align-items-center small mt-2">
                     <div class="form-check form-check-inline m-0"><input class="form-check-input" type="checkbox" id="net-l-gw" checked><label class="form-check-label" for="net-l-gw">Gateways</label></div>
                     <div class="form-check form-check-inline m-0"><input class="form-check-input" type="checkbox" id="net-l-dev" checked><label class="form-check-label" for="net-l-dev">Devices</label></div>
+                    <div class="form-check form-check-inline m-0" title="Show devices without location at a position estimated from their receiving gateways (hollow markers)"><input class="form-check-input" type="checkbox" id="net-l-est" checked><label class="form-check-label" for="net-l-est">Estimated positions</label></div>
                     <div class="d-flex align-items-center gap-1">
                       <label for="net-l-links" class="text-muted">Links</label>
                       <select class="form-select form-select-sm net-inline-sel" id="net-l-links">
@@ -850,6 +851,7 @@
                       <li><span class="net-dot" style="--c:var(--net-silent)"></span><strong>Silent</strong> — no uplink in the time window.</li>
                       <li><span class="net-dot" style="--c:var(--net-unknown)"></span><strong>No gateway data</strong> — packets carry no gateway stats (e.g. created manually or via API).</li>
                     </ul>
+                    <p class="mb-2 text-muted"><strong>Estimated positions</strong> (hollow markers): devices without a location in ELEMENT are placed from the distances implied by their RSSI to 2+ located gateways (weighted multilateration, ± radius shown on selection). Display only – never used for the reception model.</p>
                     <p class="mb-2 text-muted">Link margin = SNR − demodulation floor of the spreading factor (SF7 −7.5 dB … SF12 −20 dB).</p>
                     <p class="mb-0 text-muted"><strong>Reception map:</strong> a log-distance path-loss model (RSSI = RSSI<sub>1 km</sub> − 10·n·log<sub>10</sub>(d)) is fitted to the measured links, per gateway where enough data exists. Each cell gets the best predicted RSSI of all receiving gateways: <em>none</em> below the weak RSSI threshold, <em>marginal</em> within the fade margin, <em>single</em>/<em>covered</em> for one/two or more gateways above it. Where devices exist, their measured rating overrides the prediction. Terrain and buildings are only reflected through the fit — treat areas without devices as an estimate.</p>
                   </details>
