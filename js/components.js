@@ -1,11 +1,13 @@
 'use strict';
 
+let _toastSeq = 0;
+
 class ToastService {
   constructor() { this._el = document.getElementById('toast-container'); }
   show(msg, type = 'info') {
     const bg = { success: 'bg-success text-white', danger: 'bg-danger text-white', warning: 'bg-warning text-dark', info: 'bg-info text-dark' }[type] || '';
     const delay = (type === 'success' || type === 'info') ? 5000 : 0;
-    const id = 'toast-' + Date.now();
+    const id = `toast-${++_toastSeq}`;
     this._el.insertAdjacentHTML('beforeend',
       `<div id="${id}" class="toast ${bg}" data-bs-autohide="${delay > 0}" data-bs-delay="${delay}" role="alert">
         <div class="d-flex"><div class="toast-body">${esc(msg)}</div>
@@ -18,7 +20,7 @@ class ToastService {
     if (fail === 0) { this.show(`${label}: ${ok} succeeded`, 'success'); return; }
     const items = errors.slice(0, 5).map(e => `<li>${esc((e.item?.name || e.item || '?'))}: ${esc(e.error)}</li>`).join('');
     const more  = errors.length > 5 ? `<li>…and ${errors.length - 5} more</li>` : '';
-    const id = 'toast-' + Date.now();
+    const id = `toast-${++_toastSeq}`;
     this._el.insertAdjacentHTML('beforeend',
       `<div id="${id}" class="toast bg-warning" data-bs-autohide="false" role="alert">
         <div class="toast-header"><strong class="me-auto">${esc(label)}</strong>

@@ -121,10 +121,24 @@
             oder ähnliche verwendet.</li>
         <li>Es werden <strong>keine personenbezogenen Daten</strong> an den
             Entwickler weitergegeben.</li>
-        <li>Alle eingebundenen Bibliotheken (Bootstrap, Bootstrap Icons, jQuery)
+        <li>Alle eingebundenen Bibliotheken (Bootstrap, Bootstrap Icons, jQuery, Leaflet)
             werden <strong>lokal ausgeliefert</strong>. Es erfolgen keine
             Anfragen an externe CDN-Dienste.</li>
       </ul>
+
+      <h4>Kartendarstellung (Ansicht „Network“)</h4>
+      <p>
+        Nur beim Öffnen der Ansicht „Network“ lädt der Browser Kartenkacheln
+        standardmäßig von OpenStreetMap (OpenStreetMap Foundation, St John’s
+        Innovation Centre, Cowley Road, Cambridge, CB4 0WS, Vereinigtes Königreich).
+        Dabei wird technisch bedingt die IP-Adresse des Nutzers an den Kachelserver
+        übermittelt. Geräte- oder Messdaten werden nicht übertragen – angefragt
+        werden ausschließlich Kartenausschnitte. Der Kachelserver kann in der
+        Konfiguration geändert oder durch ein leeres Feld vollständig deaktiviert
+        werden. Weitere Informationen:
+        <a href="https://osmfoundation.org/wiki/Privacy_Policy"
+           rel="noopener noreferrer" target="_blank">Datenschutzerklärung der OpenStreetMap Foundation</a>.
+      </p>
       <p>
         Für die Datenverarbeitung durch die Element IoT API ist allein der
         Betreiber der Element IoT Plattform verantwortlich.

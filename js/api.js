@@ -21,9 +21,53 @@ function esc(s) {
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 
+// Element IoT returns UTC timestamps, sometimes without a zone suffix ("2017-08-09T09:24:42.866589").
+function parseApiDate(iso) {
+  if (!iso) return null;
+  const s = String(iso);
+  const d = new Date(/T\d{2}:\d{2}(:\d{2}(\.\d+)?)?$/.test(s) ? `${s}Z` : s);
+  return isNaN(d) ? null : d;
+}
+
 function fmtDate(iso) {
   if (!iso) return '—';
-  try { return new Date(iso).toLocaleString(); } catch { return iso; }
+  const d = parseApiDate(iso);
+  return d ? d.toLocaleString() : String(iso);
+}
+
+function fmtAgo(iso) {
+  const d = parseApiDate(iso);
+  if (!d) return '—';
+  const s = Math.round((Date.now() - d.getTime()) / 1000);
+  if (s < 60) return `${Math.max(s, 0)}s ago`;
+  if (s < 3600) return `${Math.round(s / 60)}m ago`;
+  if (s < 86400) return `${Math.round(s / 3600)}h ago`;
+  return `${Math.round(s / 86400)}d ago`;
+}
+
+function fmtDistance(m) {
+  if (m == null) return '—';
+  return m < 1000 ? `${Math.round(m)} m` : `${(m / 1000).toFixed(m < 10000 ? 2 : 1)} km`;
+}
+
+function fmtNum(v, digits = 1) {
+  return v == null || !Number.isFinite(v) ? '—' : v.toFixed(digits);
+}
+
+function downloadFile(filename, content, mime = 'text/plain') {
+  const blob = new Blob([content], { type: `${mime};charset=utf-8` });
+  const a = Object.assign(document.createElement('a'), { href: URL.createObjectURL(blob), download: filename });
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+}
+
+function toCsv(rows) {
+  const cell = v => {
+    if (v == null) return '';
+    const s = String(v);
+    return /[",;\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+  };
+  return rows.map(r => r.map(cell).join(',')).join('\r\n');
 }
 
 function hueToHex(hue) {
@@ -175,6 +219,8 @@ class ApiClient {
     }
     let lastError;
     for (let attempt = 0; attempt <= 3; attempt++) {
+      // Respect the bucket-based rate limit (default 50 requests / 10 s per API key).
+      if (this._rlRemaining <= 2) { await sleep(Math.min(this._rlReset, 10000)); this._rlRemaining = 50; }
       let res;
       try { res = await fetch(url, opts); }
       catch (e) {
@@ -188,11 +234,14 @@ class ApiClient {
         }
         throw e;
       }
-      this._rlRemaining = parseInt(res.headers.get('x-ratelimit-remaining') || '50');
-      this._rlReset = parseInt(res.headers.get('x-ratelimit-reset') || '10000');
+      const rlRemaining = parseInt(res.headers.get('x-ratelimit-remaining'), 10);
+      const rlReset = parseInt(res.headers.get('x-ratelimit-reset'), 10);
+      this._rlRemaining = Number.isFinite(rlRemaining) ? rlRemaining : 50;
+      this._rlReset = Number.isFinite(rlReset) ? rlReset : 10000;
       if (res.status === 429) {
         if (attempt >= 3) { lastError = 'Rate limit exceeded after 3 retries'; break; }
-        await sleep(this._rlReset);
+        await sleep(Math.max(this._rlReset, 1000) * (attempt + 1));
+        this._rlRemaining = 50;
         continue;
       }
       if (res.status === 401) { lastError = 'Unauthorized (401): invalid API key'; break; }
@@ -211,21 +260,25 @@ class ApiClient {
     throw new Error(lastError);
   }
 
-  async fetchAllPages(path, params = {}, onProgress = null) {
+  /**
+   * Follows retrieve_after_id pagination. Options: maxItems caps the result,
+   * shouldStop() is checked between pages to allow cancellation.
+   */
+  async fetchAllPages(path, params = {}, onProgress = null, { maxItems = Infinity, shouldStop = null } = {}) {
     const all = [];
     let cursor = null;
     const p = { limit: 100, sort: 'inserted_at', sort_direction: 'ascending', ...params };
     do {
+      if (shouldStop && shouldStop()) break;
       if (cursor) p.retrieve_after = cursor; else delete p.retrieve_after;
       const data = await this._request('GET', path, null, p);
       const body = Array.isArray(data.body) ? data.body : [];
       all.push(...body);
       cursor = data.retrieve_after_id || null;
       if (onProgress) onProgress(all.length);
-      if (this._rlRemaining <= 5) await sleep(Math.ceil(this._rlReset / Math.max(this._rlRemaining, 1)));
-      if (!cursor || body.length < p.limit) break;
+      if (!cursor || body.length < p.limit || all.length >= maxItems) break;
     } while (true);
-    return all;
+    return all.length > maxItems ? all.slice(0, maxItems) : all;
   }
 
   get(path, params) { return this._request('GET', path, null, params); }
@@ -234,9 +287,16 @@ class ApiClient {
   delete(path) { return this._request('DELETE', path); }
 
   async testConnection() {
-    const data = await this._request('GET', '/mandates', null, { limit: 1, sort_direction: 'ascending' });
-    const body = Array.isArray(data.body) ? data.body : (data.body ? [data.body] : []);
-    return body.length > 0 ? (body[0].name || 'Connected') : 'Connected';
+    // The mandate list is only available to privileged keys; mandate-scoped keys fall back to /devices.
+    try {
+      const data = await this._request('GET', '/mandates', null, { limit: 1, sort_direction: 'ascending' });
+      const body = Array.isArray(data.body) ? data.body : (data.body ? [data.body] : []);
+      return body.length > 0 ? (body[0].name || 'Connected') : 'Connected';
+    } catch (e) {
+      if (!/\(403\)|HTTP 404/.test(e.message)) throw e;
+      await this._request('GET', '/devices', null, { limit: 1 });
+      return 'Connected';
+    }
   }
 }
 

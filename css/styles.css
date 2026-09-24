@@ -67,3 +67,28 @@ th.sortable:hover { background: #e9ecef !important; }
 #sidebar.collapsed .sidebar-settings-btn .lbl { opacity: 0; pointer-events: none; }
 .sidebar-settings .card-body { background: #252a33; border: none; }
 
+
+/* ---------- Network analysis ---------- */
+:root { --net-good: #2f9e44; --net-single: #e8a400; --net-weak: #f76707; --net-silent: #e03131; --net-unknown: #868e96; }
+#net-map { height: calc(100vh - 330px); min-height: 420px; background: #e9ecef; z-index: 0; }
+.net-side { max-height: calc(100vh - 380px); min-height: 200px; }
+.net-search { width: 240px; }
+.net-inline-sel { width: auto; padding-top: .1rem; padding-bottom: .1rem; }
+.net-dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; background: var(--c); margin-right: 4px; vertical-align: -1px; border: 1px solid rgba(0,0,0,.15); }
+.net-line { display: inline-block; width: 16px; height: 3px; background: var(--c); margin: 0 3px 0 6px; vertical-align: middle; border-radius: 2px; }
+.net-q { display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: var(--c); margin-right: 4px; vertical-align: 1px; }
+.net-chip { border: 1px solid #dee2e6; background: #fff; color: #6c757d; padding: .1rem .5rem; font-size: .78rem; }
+.net-chip.active { border-color: var(--c); color: #212529; background: color-mix(in srgb, var(--c) 12%, #fff); }
+.net-chip:not(.active) .net-dot { opacity: .3; }
+.net-badge { background: var(--c); color: #fff; }
+.net-tile { border-left: 4px solid var(--c); }
+.net-dl dt { font-weight: 500; color: #6c757d; }
+.net-dl dd { margin-bottom: .2rem; }
+.net-table-wrap { max-height: 420px; }
+.net-table tbody tr { cursor: pointer; }
+.net-gw-icon { width: 26px; height: 26px; border-radius: 6px; display: flex; align-items: center; justify-content: center; color: #fff; font-size: 15px; box-shadow: 0 1px 4px rgba(0,0,0,.4); border: 2px solid #fff; background: #1c7ed6; }
+.net-gw-icon.foreign { background: #5f3dc4; }
+.net-gw-icon.idle { background: #868e96; }
+.net-gw-icon.selected { outline: 3px solid #fab005; transform: scale(1.2); }
+.net-gw-legend { display: inline-flex; width: 16px; height: 16px; border-radius: 4px; background: #1c7ed6; color: #fff; font-size: 10px; align-items: center; justify-content: center; margin-right: 4px; vertical-align: -3px; }
+.leaflet-container { font: inherit; }

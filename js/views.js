@@ -17,6 +17,9 @@ class ConfigView {
       const settings = JSON.parse(localStorage.getItem('deviceAdminSettings') || 'null');
       if (settings?.maxLogEntries) $('#cfg-max-log-entries').val(settings.maxLogEntries);
       if (settings?.maxDevices) $('#cfg-max-devices').val(settings.maxDevices);
+      if (settings?.tileUrl !== undefined) $('#cfg-tile-url').val(settings.tileUrl);
+      else $('#cfg-tile-url').val(NET_DEFAULT_TILES.url);
+      $('#cfg-tile-attr').val(settings?.tileAttribution ?? NET_DEFAULT_TILES.attribution);
     } catch {}
   }
   _bind() {
@@ -42,9 +45,12 @@ class ConfigView {
     }
     const maxEntries = parseInt($('#cfg-max-log-entries').val()) || 500;
     const maxDevices = parseInt($('#cfg-max-devices').val()) || 500;
+    const tileUrl = $('#cfg-tile-url').val().trim();
+    if (tileUrl && !/^https:\/\/.+\{z\}.*\{x\}.*\{y\}/.test(tileUrl)) { this._toast.show('Tile URL must use https:// and contain {z}, {x} and {y}', 'warning'); return; }
     window._app._apiLogger.setMaxEntries(maxEntries);
     window._app._devV.setMaxDevices(maxDevices);
-    localStorage.setItem('deviceAdminSettings', JSON.stringify({ maxLogEntries: maxEntries, maxDevices: maxDevices }));
+    localStorage.setItem('deviceAdminSettings', JSON.stringify({ maxLogEntries: maxEntries, maxDevices: maxDevices, tileUrl, tileAttribution: $('#cfg-tile-attr').val().trim() }));
+    window._app._netV.applyTileSettings();
     this._toast.show('Configuration and settings saved', 'success');
     window._app._init();
   }
@@ -97,10 +103,9 @@ class DeviceView {
     this._filterTimer = null; this._regexSearch = false;
     this._page = 1;
     this._pageSize = 50;
-    this._totalCount = 0;
     this._cursor = null;
-    this._allDevices = [];
     this._hasMore = false;
+    this._loading = false;
     this._maxDevices = 500;
     this._bulkProfileModal = bootstrap.Modal.getOrCreateInstance(document.getElementById('bulk-profile-modal'));
     this._loadMaxDevices();
@@ -113,15 +118,16 @@ class DeviceView {
     } catch {}
   }
   setMaxDevices(n) {
-    this._maxDevices = Math.max(100, Math.min(5000, parseInt(n) || 500));
+    this._maxDevices = Math.max(100, Math.min(20000, parseInt(n) || 500));
   }
   _bind() {
     $('#dev-load-all').on('click', () => this.loadAll());
-    $('#dev-refresh').on('click', () => { this._state.isLoaded.devices = false; this.loadAll(); });
+    $('#dev-refresh').on('click', () => this.loadAll());
+    $('#dev-export').on('click', () => this._exportCsv());
     $('#dev-stats').on('click', () => this.showStats());
     $('#dev-sel-all').on('change', e => this._selectAll(e.target.checked));
     $('#dev-filter-name').on('input', () => { clearTimeout(this._filterTimer); this._filterTimer = setTimeout(() => this._filter(), 300); });
-    $('#dev-filter-type, #dev-filter-folder, #dev-filter-mandate').on('change', () => {});
+    $('#dev-filter-type, #dev-filter-folder, #dev-filter-mandate, #dev-filter-location').on('change', () => this._filter());
     $('#dev-filter-apply').on('click', () => this._filter());
     $('#dev-filter-regex').on('click', () => {
       this._regexSearch = !this._regexSearch;
@@ -130,7 +136,7 @@ class DeviceView {
     });
     $('#dev-filter-reset').on('click', () => {
       $('#dev-filter-name').val('');
-      $('#dev-filter-type, #dev-filter-folder, #dev-filter-mandate').val('');
+      $('#dev-filter-type, #dev-filter-folder, #dev-filter-mandate, #dev-filter-location').val('');
       this._regexSearch = false;
       $('#dev-filter-regex').removeClass('active');
       this._filter();
@@ -138,11 +144,10 @@ class DeviceView {
     $('#dev-page-size').on('change', () => {
       this._pageSize = parseInt($('#dev-page-size').val()) || 50;
       this._page = 1;
-      this._allDevices = [];
-      this.loadPage(1);
+      this._renderTable();
     });
-    $('#dev-page-prev').on('click', () => { if (this._page > 1) { this._page--; this.loadPage(this._page); } });
-    $('#dev-page-next').on('click', () => { if (this._hasMore) { this._page++; this.loadPage(this._page); } });
+    $('#dev-page-prev').on('click', () => { if (this._page > 1) { this._page--; this._renderTable(); } });
+    $('#dev-page-next').on('click', () => { if (this._page < this._pageCount()) { this._page++; this._renderTable(); } });
     $('#dev-load-more').on('click', () => this._loadMore());
     $('#dev-clear').on('click', () => this._clearDevices());
     $('#bulk-add-folder').on('click', () => this._bulkAddFolder());
@@ -185,159 +190,140 @@ class DeviceView {
     $('#bpe-profile-sel').html('<option value="">Select profile…</option>' + opts);
   }
 
+  // Loads devices page by page (100 per request) up to the configured in-memory limit.
   async loadAll() {
     if (!this._api.apiKey) { this._toast.show('Configure API credentials first', 'warning'); return; }
-    this._page = 1;
-    this._allDevices = [];
+    if (this._loading) return;
     this._cursor = null;
     this._hasMore = false;
-    this._lb.start(); $('#dev-not-loaded').hide(); $('#dev-table-wrap').addClass('d-none');
-    try {
-      await this.loadPage(1);
-    } catch(e) {
-      this._lb.finish(); this._toast.show(`Failed: ${e.message}`, 'danger');
-      if (!this._state.isLoaded.devices) $('#dev-not-loaded').show();
-    }
-  }
-
-  async loadPage(pageNum) {
-    this._lb.start();
-    try {
-      const params = { 
-        limit: this._pageSize, 
-        sort: this._sortCol || 'name', 
-        sort_direction: this._sortDir || 'ascending', 
-        with_profile: 1 
-      };
-      if (this._cursor && pageNum > 1) {
-        params.retrieve_after = this._cursor;
-      }
-      const data = await this._api.get('/devices', params);
-      const devices = Array.isArray(data.body) ? data.body : [];
-      this._cursor = data.retrieve_after_id || null;
-      this._hasMore = this._cursor && devices.length >= this._pageSize;
-      
-      if (pageNum === 1) {
-        this._allDevices = devices;
-      } else {
-        this._allDevices = [...this._allDevices, ...devices];
-      }
-      
-      this._state.setDevices(this._allDevices);
-      this._totalCount = data.total_count || this._allDevices.length;
-      $('#device-count').text(this._totalCount);
-      window._app?._actV._renderDeviceChooser();
-      this._updatePagination();
-      this._renderTable();
-      $('#dev-table-wrap').removeClass('d-none');
-      $('#dev-not-loaded').addClass('d-none');
-      $('#dev-clear').removeClass('d-none');
-      this._lb.finish();
-      this._toast.show(`Loaded page ${pageNum} (${devices.length} devices)`, 'success');
-    } catch(e) {
-      this._lb.finish(); 
-      this._toast.show(`Failed to load page: ${e.message}`, 'danger');
-      throw e;
-    }
+    $('#dev-not-loaded').addClass('d-none');
+    const devices = await this._fetchChunk(this._maxDevices, []);
+    if (devices) this._toast.show(`Loaded ${devices.length} device${devices.length === 1 ? '' : 's'}`, 'success');
+    else if (!this._state.isLoaded.devices) $('#dev-not-loaded').removeClass('d-none');
   }
 
   async _loadMore() {
-    if (this._allDevices.length >= this._maxDevices) {
-      this._hasMore = false;
-      this._updatePagination();
-      this._toast.show(`Memory limit reached (${this._maxDevices} devices). Clear to load more.`, 'warning');
-      return;
-    }
+    if (!this._cursor || this._loading) return;
+    await this._fetchChunk(this._maxDevices, this._state.devices);
+  }
+
+  async _fetchChunk(max, existing) {
+    this._loading = true;
     this._lb.start();
+    $('#dev-load-all, #dev-refresh, #dev-load-more').prop('disabled', true);
     try {
-      const params = { 
-        limit: this._pageSize, 
-        sort: this._sortCol || 'name', 
-        sort_direction: this._sortDir || 'ascending', 
-        with_profile: 1,
-        retrieve_after: this._cursor
-      };
-      const data = await this._api.get('/devices', params);
-      const devices = Array.isArray(data.body) ? data.body : [];
-      this._cursor = data.retrieve_after_id || null;
-      this._hasMore = this._cursor && devices.length >= this._pageSize && this._allDevices.length < this._maxDevices;
-      
-      this._allDevices = [...this._allDevices, ...devices];
-      this._state.setDevices(this._allDevices);
-      this._totalCount = data.total_count || this._allDevices.length;
-      $('#device-count').text(this._totalCount);
+      const all = [...existing];
+      let cursor = this._cursor;
+      let loaded = 0;
+      do {
+        const params = { limit: 100, sort: 'inserted_at', sort_direction: 'ascending', with_profile: 1 };
+        if (cursor) params.retrieve_after = cursor;
+        const data = await this._api.get('/devices', params);
+        const body = Array.isArray(data.body) ? data.body : [];
+        all.push(...body); loaded += body.length;
+        cursor = body.length >= 100 ? (data.retrieve_after_id || null) : null;
+        this._lb.setProgress(Math.min(95, loaded / max * 100), `Loading devices… ${all.length}`);
+      } while (cursor && loaded < max);
+      this._cursor = cursor;
+      this._hasMore = !!cursor;
+      this._state.setDevices(all);
+      $('#device-count').text(all.length + (this._hasMore ? '+' : ''));
       window._app?._actV._renderDeviceChooser();
-      this._updatePagination();
-      this._renderTable();
+      $('#dev-table-wrap').removeClass('d-none');
+      $('#dev-not-loaded').addClass('d-none');
+      $('#dev-clear').removeClass('d-none');
+      this._page = 1;
+      this._filter();
+      return all;
+    } catch (e) {
+      this._toast.show(`Failed to load devices: ${e.message}`, 'danger');
+      return null;
+    } finally {
+      this._loading = false;
       this._lb.finish();
-    } catch(e) {
-      this._lb.finish(); 
-      this._toast.show(`Failed to load more: ${e.message}`, 'danger');
+      $('#dev-load-all, #dev-refresh, #dev-load-more').prop('disabled', false);
     }
   }
 
+  _pageCount() { return Math.max(1, Math.ceil(this._filtered.length / this._pageSize)); }
+
   _updatePagination() {
-    const totalPages = Math.max(1, Math.ceil(this._totalCount / this._pageSize));
-    const showing = this._allDevices.length;
-    let info = `Page ${this._page} of ${totalPages} (${this._totalCount} total)`;
-    if (showing < this._totalCount) {
-      info = `Showing ${showing} of ${this._totalCount} devices`;
-    }
+    const total = this._filtered.length, pages = this._pageCount();
+    if (this._page > pages) this._page = pages;
+    const from = total ? (this._page - 1) * this._pageSize + 1 : 0, to = Math.min(this._page * this._pageSize, total);
+    let info = `${from}–${to} of ${total}${total !== this._state.devices.length ? ` (filtered from ${this._state.devices.length})` : ''} · page ${this._page}/${pages}`;
+    if (this._hasMore) info += ` · limit of ${this._maxDevices} reached`;
     $('#dev-page-info').text(info);
     $('#dev-page-prev').prop('disabled', this._page <= 1);
-    $('#dev-page-next').prop('disabled', !this._hasMore);
-    if (this._hasMore) {
-      $('#dev-load-more').removeClass('d-none');
-    } else {
-      $('#dev-load-more').addClass('d-none');
-    }
+    $('#dev-page-next').prop('disabled', this._page >= pages);
+    $('#dev-load-more').toggleClass('d-none', !this._hasMore).text(`Load ${this._maxDevices} more`);
   }
 
   _clearDevices() {
-    this._allDevices = [];
     this._state.setDevices([]);
     this._filtered = [];
     this._selected.clear();
     this._cursor = null;
     this._hasMore = false;
     this._page = 1;
-    this._totalCount = 0;
     this._state.isLoaded.devices = false;
+    this._updateBar();
     $('#device-count').text('0');
     $('#dev-table-wrap').addClass('d-none');
     $('#dev-not-loaded').removeClass('d-none');
     $('#dev-clear').addClass('d-none');
-    $('#dev-page-info').text('Page 1 of 1 (0 devices)');
+    $('#dev-page-info').text('');
     this._toast.show('Device list cleared from memory', 'info');
+  }
+
+  _exportCsv() {
+    const list = this._filtered.length ? this._filtered : this._state.devices;
+    if (!list.length) { this._toast.show('Load devices first', 'warning'); return; }
+    const rows = [['id', 'name', 'slug', 'type', 'mandate', 'folders', 'latitude', 'longitude', 'eui', 'created', 'updated']];
+    list.forEach(d => {
+      const ll = NetAnalysis.deviceLatLng(d);
+      const euis = (d.interfaces || []).flatMap(i => Object.entries(i.opts || {}).filter(([k, v]) => /eui/i.test(k) && v).map(([, v]) => v));
+      rows.push([d.id, d.name, d.slug, d.type, this._state.mandateMap[d.mandate_id]?.name || d.mandate_id, (d.tags || []).map(t => t.name).join('; '),
+        ll?.[0], ll?.[1], [...new Set(euis)].join('; '), d.inserted_at, d.updated_at]);
+    });
+    downloadFile(`elmo-devices-${new Date().toISOString().slice(0, 10)}.csv`, toCsv(rows), 'text/csv');
   }
 
   _filter() {
     const q = $('#dev-filter-name').val() || '';
     const type = $('#dev-filter-type').val(), fid = $('#dev-filter-folder').val(), mandateId = $('#dev-filter-mandate').val();
+    const loc = $('#dev-filter-location').val();
     const matcher = buildSearchMatcher(q, this._regexSearch);
     let list = this._state.devices;
-    if (q)    list = list.filter(d => matcher(d.name) || matcher(d.slug));
+    if (q)    list = list.filter(d => matcher(d.name) || matcher(d.slug) || matcher(d.id) ||
+      (d.interfaces || []).some(i => Object.entries(i.opts || {}).some(([k, v]) => /eui|address/i.test(k) && typeof v === 'string' && v && matcher(v))));
+    if (loc)  list = list.filter(d => !!NetAnalysis.deviceLatLng(d) === (loc === 'with'));
     if (type) list = list.filter(d => d.type === type);
     if (fid)  list = list.filter(d => Array.isArray(d.tags) && d.tags.some(t => t.id === fid));
     if (mandateId) list = list.filter(d => d.mandate_id === mandateId);
     const dir = this._sortDir === 'asc' ? 1 : -1;
     const col = this._sortCol;
-    list = [...list].sort((a,b) => ((a[col]||'') < (b[col]||'') ? -dir : (a[col]||'') > (b[col]||'') ? dir : 0));
+    const key = d => String(d[col] || '').toLowerCase();
+    list = [...list].sort((a,b) => (key(a) < key(b) ? -dir : key(a) > key(b) ? dir : 0));
     this._filtered = list;
-    $('#dev-filter-count').text(list.length !== this._state.devices.length ? `${list.length} shown` : '');
+    this._page = 1;
+    $('#dev-filter-count').text(list.length !== this._state.devices.length ? `${list.length} of ${this._state.devices.length} shown` : '');
     this._renderTable();
   }
 
   _renderTable() {
-    const rows = this._filtered.map(d => {
+    this._updatePagination();
+    const start = (this._page - 1) * this._pageSize;
+    const rows = this._filtered.slice(start, start + this._pageSize).map(d => {
       const tags = (d.tags||[]).slice(0,3).map(t => {
         const c = this._state.tagMap[t.id]?.color_hue != null ? hueToHex(this._state.tagMap[t.id].color_hue) : '#6c757d';
         return `<span class="badge tag-badge-item me-1" style="background:${c};color:#fff">${esc(t.name)}</span>`;
       }).join('') + ((d.tags||[]).length > 3 ? `<small class="text-muted">+${d.tags.length-3}</small>` : '');
       const sel = this._selected.has(d.id) ? 'checked' : '';
+      const loc = NetAnalysis.deviceLatLng(d) ? '' : ' <i class="bi bi-geo-alt text-muted opacity-50" title="No location"></i>';
       return `<tr>
         <td><input type="checkbox" class="form-check-input dev-cb" data-id="${d.id}" ${sel}></td>
-        <td><a href="#" class="dev-open text-decoration-none" data-id="${d.id}">${esc(d.name||d.slug)}</a></td>
+        <td><a href="#" class="dev-open text-decoration-none" data-id="${d.id}">${esc(d.name||d.slug)}</a>${loc}</td>
         <td class="text-muted small d-none d-md-table-cell">${esc(d.slug)}</td>
         <td>${typeBadge(d.type)}</td>
         <td>${tags}</td>
@@ -358,19 +344,10 @@ class DeviceView {
 
   _selectAll(checked) {
     if (checked) this._filtered.forEach(d => this._selected.add(d.id));
-    else this._selected.clear();
+    else this._filtered.forEach(d => this._selected.delete(d.id));
     this._renderTable(); this._updateBar();
   }
   _clearSel() { this._selected.clear(); $('#dev-sel-all').prop('checked', false); this._renderTable(); this._updateBar(); }
-  clearCache() {
-    this._allDevices = [];
-    this._filtered = [];
-    this._selected.clear();
-    this._cursor = null;
-    this._hasMore = false;
-    this._page = 1;
-    this._totalCount = 0;
-  }
   _updateBar() {
     const n = this._selected.size;
     n > 0 ? ($('#bulk-action-bar').removeClass('d-none'), $('#bulk-selected-count').text(`${n} selected`)) : $('#bulk-action-bar').addClass('d-none');
@@ -600,9 +577,9 @@ class TagView {
     $('#folder-new').on('click', () => this._openForm(null));
     $('#folder-save').on('click', () => this._save());
     $('#folder-hue').on('input', () => this._updateHue());
-    $('#tag-filter-name').on('input', () => {});
-    $('#tag-filter-regex').on('click', () => { this._regexSearch = !this._regexSearch; $('#tag-filter-regex').toggleClass('active', this._regexSearch); });
-    $('#tag-filter-mandate').on('change', () => {});
+    $('#tag-filter-name').on('input', () => { clearTimeout(this._filterTimer); this._filterTimer = setTimeout(() => this.render(), 250); });
+    $('#tag-filter-regex').on('click', () => { this._regexSearch = !this._regexSearch; $('#tag-filter-regex').toggleClass('active', this._regexSearch); this.render(); });
+    $('#tag-filter-mandate').on('change', () => this.render());
     $('#tag-filter-apply').on('click', () => this.render());
     $('#tag-filter-reset').on('click', () => {
       $('#tag-filter-name, #tag-filter-mandate').val('');
@@ -636,6 +613,10 @@ class TagView {
     $('#tag-filter-mandate-wrap').toggleClass('d-none', this._state.mandates.length <= 1);
   }
   render() {
+    if (this._state.isLoaded.tags) {
+      $('#folders-not-loaded, #folders-loading').addClass('d-none');
+      $('#folders-table-wrap').removeClass('d-none');
+    }
     const q = $('#tag-filter-name').val() || '';
     const mandateId = $('#tag-filter-mandate').val();
     const matcher = buildSearchMatcher(q, this._regexSearch);
@@ -740,6 +721,7 @@ class TagView {
       this._state.updateTag(data.body); this.render();
       $('#folder-count').text(this._state.tags.length);
       window._app?._devV.populateFolderDropdowns();
+      window._app?._netV.populateFolderDropdown();
       bootstrap.Modal.getInstance(document.getElementById('folder-modal')).hide();
       this._toast.show(`Folder "${name}" ${id ? 'updated' : 'created'}`, 'success');
     } catch(e) { this._toast.show(`Save failed: ${e.message}`, 'danger'); }
@@ -782,6 +764,12 @@ class MandateView {
       $('#mandates-not-loaded').removeClass('d-none');
       this._toast.show(`Mandates: ${e.message}`, 'danger'); 
     }
+  }
+  render() {
+    if (!this._state.isLoaded.mandates) return;
+    $('#mandates-not-loaded, #mandates-loading').addClass('d-none');
+    $('#mandates-container').removeClass('d-none');
+    this._render();
   }
   _render() {
     const c = document.getElementById('mandates-container');
@@ -863,7 +851,7 @@ class MandateView {
 }
 
 class ActionsView {
-  constructor(api, state, toast) {
+  constructor(api, state, toast, bulkModal) {
     this._api = api; this._state = state; this._toast = toast;
     this._cursor = null;
     this._recentActions = [];
@@ -871,7 +859,7 @@ class ActionsView {
     this._selectedActions = new Set();
     this._selectedSchedules = new Set();
     this._selectedCreateDevices = new Set();
-    this._bm = new BulkProgressModal();
+    this._bm = bulkModal;
     this._bind();
   }
   _bind() {
@@ -1136,8 +1124,9 @@ class DeviceDetailPanel {
       this._rCursor = this._pCursor = this._aCursor = null;
     });
   }
-  open(id) {
-    const d = this._state.deviceMap[id]; if (!d) return;
+  open(idOrDevice) {
+    const d = typeof idOrDevice === 'object' ? idOrDevice : this._state.deviceMap[idOrDevice];
+    if (!d) return;
     this._device = d; this._cache = {}; this._ifaceCache = null;
     this._rCursor = this._pCursor = this._aCursor = null;
     document.getElementById('detail-title').textContent = d.name || d.slug;
@@ -1153,6 +1142,7 @@ class DeviceDetailPanel {
     try {
       await ({ overview: () => this._renderOverview(), interfaces: () => this._renderInterfaces(),
                readings: () => this._renderReadings(false), packets: () => this._renderPackets(false),
+               reception: () => this._renderReception(),
                actions: () => this._renderActions(false) })[tab]?.call(this);
       this._cache[tab] = el.innerHTML;
       this._reattach(tab);
@@ -1313,6 +1303,51 @@ class DeviceDetailPanel {
     const el = document.getElementById('detail-content');
     if (append) { el.querySelector('tbody')?.insertAdjacentHTML('beforeend', rows); el.querySelector('#pk-more')?.remove(); if (more) el.insertAdjacentHTML('beforeend', more); }
     else el.innerHTML = `<div class="table-responsive"><table class="table table-sm table-hover"><thead><tr><th>Received</th><th>Type</th><th>Payload</th></tr></thead><tbody>${rows}</tbody></table></div>${more}`;
+  }
+
+  // Which gateways received the most recent uplinks of this device (from packet gateway stats).
+  async _renderReception() {
+    const d = this._device;
+    if (d.type === 'gateway') {
+      document.getElementById('detail-content').innerHTML = `<p class="text-muted">This is a gateway. To see which devices it receives, run an analysis in the
+        <a href="#network" onclick="bootstrap.Offcanvas.getInstance(document.getElementById('device-detail-offcanvas'))?.hide()">Network</a> view and select it on the map.</p>`;
+      return;
+    }
+    const r = await this._api.get(`/devices/${d.id}/packets`, { limit: 50, packet_type: 'up', sort_direction: 'descending' });
+    const packets = Array.isArray(r.body) ? r.body : [];
+    const el = document.getElementById('detail-content');
+    if (!packets.length) { el.innerHTML = '<p class="text-muted">No uplink packets found.</p>'; return; }
+    const gatewayDevices = this._state.devices.filter(x => x.type === 'gateway');
+    const res = NetAnalysis.analyze({ devices: [d], packetsByDevice: new Map([[d.id, packets]]), gatewayDevices });
+    const st = res.devices[0];
+    const links = [...st.links.values()].sort((a, b) => b.count - a.count);
+    const linkRows = links.map(l => `<tr>
+        <td>${esc(l.gw.name || l.gw.key)}${l.gw.name ? `<div class="small text-muted font-monospace">${esc(l.gw.key)}</div>` : ''}</td>
+        <td class="text-end">${l.count}</td>
+        <td class="text-end"><span class="net-q" style="--c:${NET_LINK_COLOR[l.quality]}"></span>${fmtNum(l.rssiAvg, 0)} <small class="text-muted">/ ${fmtNum(l.rssiBest, 0)}</small></td>
+        <td class="text-end">${fmtNum(l.snrAvg)} <small class="text-muted">/ ${fmtNum(l.snrBest)}</small></td>
+        <td class="text-end">${fmtNum(l.margin)}</td>
+        <td class="text-end">${fmtDistance(l.distance)}</td>
+        <td class="small text-muted">${fmtAgo(l.lastSeen)}</td></tr>`).join('');
+    const pktRows = packets.slice(0, 20).map(p => {
+      const gws = NetAnalysis.extractGateways(p).sort((a, b) => (b.rssi ?? -999) - (a.rssi ?? -999));
+      const sf = NetAnalysis.extractSf(p);
+      return `<tr><td class="small">${fmtDate(p.transceived_at || p.inserted_at)}</td><td>${sf != null ? `SF${sf}` : '—'}</td>
+        <td class="small">${gws.map(g => `<span class="badge bg-light text-dark border me-1" title="${esc(g.id)}">${esc(res.gateways.find(x => (x.ids || []).includes(g.id) || x.key === g.id)?.name || g.id)}: ${fmtNum(g.rssi, 0)} / ${fmtNum(g.snr)}</span>`).join('') || '<span class="text-muted">no gateway data</span>'}</td></tr>`;
+    }).join('');
+    const loadedGw = gatewayDevices.length ? '' : '<div class="small text-muted mb-2"><i class="bi bi-info-circle me-1"></i>Load devices (incl. gateways) in the Devices view to show gateway names and distances.</div>';
+    el.innerHTML = `
+      <div class="d-flex flex-wrap gap-3 mb-2 small">
+        <div>${netStatusBadge(st.status)}</div>
+        <div><span class="text-muted">Uplinks analysed:</span> ${st.packets}</div>
+        <div><span class="text-muted">Gateways / packet:</span> ${fmtNum(st.gwAvg)}</div>
+        <div><span class="text-muted">Avg SF:</span> ${st.sfAvg != null ? fmtNum(st.sfAvg) : '—'}</div>
+      </div>
+      ${loadedGw}
+      ${links.length ? `<div class="table-responsive"><table class="table table-sm"><thead><tr><th>Gateway</th><th class="text-end">Pkt</th><th class="text-end">RSSI avg / best</th><th class="text-end">SNR avg / best</th><th class="text-end">Margin</th><th class="text-end">Dist.</th><th>Last</th></tr></thead><tbody>${linkRows}</tbody></table></div>`
+        : '<p class="text-muted">The packets of this device carry no gateway statistics (depends on the driver).</p>'}
+      <h6 class="mt-3">Latest uplinks <small class="text-muted">(RSSI / SNR per gateway)</small></h6>
+      <div class="table-responsive"><table class="table table-sm table-hover"><thead><tr><th>Received</th><th>SF</th><th>Gateways</th></tr></thead><tbody>${pktRows}</tbody></table></div>`;
   }
 
   async _renderActions(append) {
